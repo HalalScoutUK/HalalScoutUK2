@@ -128,8 +128,10 @@ export default function UKHalalAppMapbox() {
 
   const [showCertModal, setShowCertModal] = useState(false);
   const [showOwnerModal, setShowOwnerModal] = useState(false);
-  const [myPoints, setMyPoints] = useState(480);
-  const [myTotalThumbsUp, setMyTotalThumbsUp] = useState(850); 
+  
+  // New users start from 0 points
+  const [myPoints, setMyPoints] = useState(0);
+  const [myTotalThumbsUp, setMyTotalThumbsUp] = useState(0); 
   const [newReviewText, setNewReviewText] = useState("");
   const [newReviewRating, setNewReviewRating] = useState<number>(5);
   const [reviewError, setReviewError] = useState("");
@@ -159,6 +161,7 @@ export default function UKHalalAppMapbox() {
         setUsername(null);
         setIsVerifiedOwner(false);
         setRole("USER");
+        setMyPoints(0);
       }
     });
 
@@ -168,7 +171,7 @@ export default function UKHalalAppMapbox() {
   async function checkUserProfile(userId: string) {
     const { data, error } = await supabase
       .from("profiles")
-      .select("username")
+      .select("username, points")
       .eq("id", userId)
       .single();
 
@@ -176,6 +179,7 @@ export default function UKHalalAppMapbox() {
       setShowUsernameModal(true);
     } else {
       setUsername(data.username);
+      if (data.points != null) setMyPoints(data.points);
     }
   }
 
@@ -191,6 +195,7 @@ export default function UKHalalAppMapbox() {
     const { error } = await supabase.from("profiles").upsert({
       id: user.id,
       username: trimmed,
+      points: 0,
       updated_at: new Date().toISOString(),
     });
 
