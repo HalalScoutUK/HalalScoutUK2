@@ -217,16 +217,6 @@ export default function UKHalalAppMapbox() {
     }
   }
 
-  const handleSocialLogin = async (provider: "google" | "facebook" | "apple") => {
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider,
-      options: {
-        redirectTo: window.location.origin,
-      },
-    });
-    if (error) setAuthError(error.message);
-  };
-
   const handleAuthSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError("");
@@ -492,7 +482,7 @@ export default function UKHalalAppMapbox() {
   );
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 pb-20 font-sans">
+    <div className="min-h-screen bg-slate-950 text-slate-100 pb-20 font-sans overflow-x-hidden">
       <style jsx global>{`
         .mapboxgl-popup-content {
           background: transparent !important;
@@ -523,8 +513,36 @@ export default function UKHalalAppMapbox() {
             <span className="text-xs text-slate-400 hidden sm:inline">Waze-Style Discovery</span>
           </div>
 
+          {/* MIDDLE: User / Owner Toggle */}
+          {user && (
+            <div className="flex bg-slate-800 p-1 rounded-xl border border-slate-700 text-xs shadow-inner">
+              <button
+                onClick={() => setRole("USER")}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg font-medium transition ${
+                  role === "USER" ? "bg-emerald-500 text-slate-950 font-bold shadow" : "text-slate-300 hover:text-white"
+                }`}
+              >
+                <UserCheck className="w-3.5 h-3.5" /> User
+              </button>
+              <button
+                onClick={() => {
+                  if (isVerifiedOwner) {
+                    setRole("OWNER");
+                  } else {
+                    setShowOwnerVerifyModal(true);
+                  }
+                }}
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-lg font-medium transition ${
+                  role === "OWNER" ? "bg-amber-400 text-slate-950 font-bold shadow" : "text-slate-300 hover:text-white"
+                }`}
+              >
+                <Store className="w-3.5 h-3.5" /> Owner {isVerifiedOwner ? "" : "🔒"}
+              </button>
+            </div>
+          )}
+
+          {/* RIGHT: Profile & Sign Out / Sign In */}
           <div className="flex items-center gap-3">
-            {/* Clickable Profile & Points Pill */}
             {user && (
               <button
                 onClick={() => setShowProfileModal(true)}
@@ -540,16 +558,14 @@ export default function UKHalalAppMapbox() {
             )}
 
             {user ? (
-              <div className="flex items-center gap-2 bg-slate-800 px-3 py-1.5 rounded-xl border border-slate-700 text-xs">
-                <span className="text-emerald-400 font-semibold truncate max-w-[120px]">{user.email}</span>
-                <button
-                  onClick={handleSignOut}
-                  title="Sign Out"
-                  className="text-slate-400 hover:text-white transition p-1"
-                >
-                  <LogOut className="w-3.5 h-3.5" />
-                </button>
-              </div>
+              <button
+                onClick={handleSignOut}
+                title="Sign Out"
+                className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 p-2 sm:px-3.5 sm:py-1.5 rounded-xl text-xs font-bold border border-slate-700 transition shadow"
+              >
+                <LogOut className="w-4 h-4 text-rose-400" />
+                <span className="hidden sm:inline">Sign Out</span>
+              </button>
             ) : (
               <button
                 onClick={() => { setAuthMode("SIGNIN"); setShowAuthModal(true); }}
@@ -557,33 +573,6 @@ export default function UKHalalAppMapbox() {
               >
                 <LogIn className="w-3.5 h-3.5" /> Sign In / Up
               </button>
-            )}
-
-            {user && (
-              <div className="flex bg-slate-800 p-1 rounded-xl border border-slate-700 text-xs shadow-inner">
-                <button
-                  onClick={() => setRole("USER")}
-                  className={`flex items-center gap-1.5 px-3 py-1 rounded-lg font-medium transition ${
-                    role === "USER" ? "bg-emerald-500 text-slate-950 font-bold shadow" : "text-slate-300 hover:text-white"
-                  }`}
-                >
-                  <UserCheck className="w-3.5 h-3.5" /> User
-                </button>
-                <button
-                  onClick={() => {
-                    if (isVerifiedOwner) {
-                      setRole("OWNER");
-                    } else {
-                      setShowOwnerVerifyModal(true);
-                    }
-                  }}
-                  className={`flex items-center gap-1.5 px-3 py-1 rounded-lg font-medium transition ${
-                    role === "OWNER" ? "bg-amber-400 text-slate-950 font-bold shadow" : "text-slate-300 hover:text-white"
-                  }`}
-                >
-                  <Store className="w-3.5 h-3.5" /> Owner {isVerifiedOwner ? "" : "🔒"}
-                </button>
-              </div>
             )}
           </div>
         </div>
@@ -642,7 +631,7 @@ export default function UKHalalAppMapbox() {
             </div>
           </div>
 
-          <div className="h-[340px] w-full relative overflow-hidden isolate">
+          <div className="h-[280px] sm:h-[340px] w-full relative overflow-hidden isolate">
             <Map
               {...viewState}
               onMove={(evt) => setViewState(evt.viewState)}
@@ -1245,7 +1234,7 @@ export default function UKHalalAppMapbox() {
         </div>
       )}
 
-      {/* AUTHENTICATION MODAL (EMAIL + SOCIAL BUTTONS) */}
+      {/* AUTHENTICATION MODAL (EMAIL) */}
       {showAuthModal && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-sm w-full p-6 space-y-4 shadow-2xl">
@@ -1263,34 +1252,6 @@ export default function UKHalalAppMapbox() {
                 {authError}
               </div>
             )}
-
-            {/* Social Logins */}
-            <div className="space-y-2 pt-1">
-              <button
-                onClick={() => handleSocialLogin("google")}
-                className="w-full bg-white hover:bg-slate-100 text-slate-900 font-semibold py-2 px-4 rounded-lg text-xs flex items-center justify-center gap-2 transition shadow"
-              >
-                <span>Continue with Google</span>
-              </button>
-              <button
-                onClick={() => handleSocialLogin("apple")}
-                className="w-full bg-black hover:bg-slate-900 text-white font-semibold py-2 px-4 rounded-lg text-xs flex items-center justify-center gap-2 transition shadow border border-slate-800"
-              >
-                <span>Continue with Apple</span>
-              </button>
-              <button
-                onClick={() => handleSocialLogin("facebook")}
-                className="w-full bg-blue-600 hover:bg-blue-500 text-white font-semibold py-2 px-4 rounded-lg text-xs flex items-center justify-center gap-2 transition shadow"
-              >
-                <span>Continue with Facebook</span>
-              </button>
-            </div>
-
-            <div className="flex items-center my-3">
-              <div className="flex-grow border-t border-slate-800"></div>
-              <span className="flex-shrink mx-2 text-[10px] uppercase text-slate-500 font-bold">Or with email</span>
-              <div className="flex-grow border-t border-slate-800"></div>
-            </div>
 
             <form onSubmit={handleAuthSubmit} className="space-y-3 text-xs">
               <div>
