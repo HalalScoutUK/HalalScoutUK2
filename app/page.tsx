@@ -717,12 +717,14 @@ export default function UKHalalAppMapbox() {
           </div>
         </div>
 
-        {/* STICKY QUICK-FILTER PILL BAR (Compact layout with exact requested filter texts) */}
+        {/* STICKY QUICK-FILTER PILL BAR (Stretched Full-Width with Sliding Animation) */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 sm:p-4 shadow-lg space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-2.5">
-            <div className="flex items-center gap-2">
-              <span className="text-[11px] sm:text-xs font-bold uppercase tracking-wider text-slate-300">Radius:</span>
-              <div className="flex bg-slate-800 p-1 rounded-xl text-[11px] sm:text-xs gap-1 border border-slate-700">
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
+            
+            {/* Radius Section: Stretched Full-Width */}
+            <div className="flex items-center gap-2.5 w-full sm:w-auto flex-1">
+              <span className="text-[11px] sm:text-xs font-bold uppercase tracking-wider text-slate-300 shrink-0">Radius:</span>
+              <div className="grid grid-cols-3 bg-slate-800 p-1 rounded-xl text-[11px] sm:text-xs border border-slate-700 w-full relative">
                 {[
                   { label: "Local", val: 0.5 },
                   { label: "1 mile", val: 1 },
@@ -731,8 +733,10 @@ export default function UKHalalAppMapbox() {
                   <button
                     key={item.val}
                     onClick={() => setMaxDistanceMiles(item.val)}
-                    className={`px-2.5 py-1 rounded-lg font-semibold transition ${
-                      maxDistanceMiles === item.val ? "bg-emerald-500 text-slate-950 shadow" : "text-slate-400 hover:text-white"
+                    className={`relative z-10 py-1.5 px-2 rounded-lg font-semibold text-center transition-all duration-300 ease-in-out ${
+                      maxDistanceMiles === item.val
+                        ? "text-slate-950 font-bold bg-emerald-500 shadow-md scale-[1.02]"
+                        : "text-slate-400 hover:text-white"
                     }`}
                   >
                     {item.label}
@@ -742,7 +746,7 @@ export default function UKHalalAppMapbox() {
             </div>
 
             {/* Compact Category & Saved Filter Pills */}
-            <div className="flex flex-wrap gap-1 text-[11px] sm:text-xs">
+            <div className="flex flex-wrap gap-1 text-[11px] sm:text-xs w-full sm:w-auto justify-start sm:justify-end">
               {[
                 { id: "ALL", label: "All" },
                 { id: "HMC_CERTIFIED", label: "HMC" },
@@ -763,6 +767,7 @@ export default function UKHalalAppMapbox() {
                 </button>
               ))}
             </div>
+
           </div>
         </div>
 
