@@ -717,21 +717,21 @@ export default function UKHalalAppMapbox() {
           </div>
         </div>
 
-        {/* STICKY QUICK-FILTER PILL BAR */}
-        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-lg space-y-3">
-          <div className="flex flex-wrap items-center justify-between gap-3">
+        {/* STICKY QUICK-FILTER PILL BAR (Compact layout with exact requested filter texts) */}
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 sm:p-4 shadow-lg space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2.5">
             <div className="flex items-center gap-2">
-              <span className="text-xs font-bold uppercase tracking-wider text-slate-300">Radius Filter:</span>
-              <div className="flex bg-slate-800 p-1 rounded-xl text-xs gap-1 border border-slate-700">
+              <span className="text-[11px] sm:text-xs font-bold uppercase tracking-wider text-slate-300">Radius:</span>
+              <div className="flex bg-slate-800 p-1 rounded-xl text-[11px] sm:text-xs gap-1 border border-slate-700">
                 {[
-                  { label: "0.5 mi (Local)", val: 0.5 },
-                  { label: "1 mi", val: 1 },
-                  { label: "5 mi", val: 5 },
+                  { label: "Local", val: 0.5 },
+                  { label: "1 mile", val: 1 },
+                  { label: "5 mile", val: 5 },
                 ].map((item) => (
                   <button
                     key={item.val}
                     onClick={() => setMaxDistanceMiles(item.val)}
-                    className={`px-3 py-1 rounded-lg font-semibold transition ${
+                    className={`px-2.5 py-1 rounded-lg font-semibold transition ${
                       maxDistanceMiles === item.val ? "bg-emerald-500 text-slate-950 shadow" : "text-slate-400 hover:text-white"
                     }`}
                   >
@@ -741,16 +741,19 @@ export default function UKHalalAppMapbox() {
               </div>
             </div>
 
-            <div className="flex flex-wrap gap-1.5 text-xs">
+            {/* Compact Category & Saved Filter Pills */}
+            <div className="flex flex-wrap gap-1 text-[11px] sm:text-xs">
               {[
-                { id: "ALL", label: "All Categories" },
-                { id: "HMC_CERTIFIED", label: "HMC Certified" },
-                ...(user ? [{ id: "FAVOURITES", label: `❤️ Saved (${favorites.length})` }] : []),
+                { id: "ALL", label: "All" },
+                { id: "HMC_CERTIFIED", label: "HMC" },
+                { id: "HALAL_CERTIFIED", label: "Halal Certified" },
+                { id: "HALAL_OPTIONS", label: "Halal Options" },
+                ...(user ? [{ id: "FAVOURITES", label: `❤️ (${favorites.length})` }] : []),
               ].map((tab) => (
                 <button
                   key={tab.id}
                   onClick={() => setSelectedFilter(tab.id)}
-                  className={`px-3 py-1.5 rounded-xl font-medium border transition ${
+                  className={`px-2.5 py-1.5 rounded-xl font-medium border transition ${
                     selectedFilter === tab.id
                       ? "bg-emerald-500/20 border-emerald-500 text-emerald-300 shadow"
                       : "bg-slate-800/80 border-slate-700 text-slate-400 hover:bg-slate-800 hover:text-white"
