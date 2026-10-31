@@ -770,7 +770,8 @@ export default function UKHalalAppMapbox() {
               }}
               mapStyle="mapbox://styles/mapbox/dark-v11"
               mapboxAccessToken={
-                process.env.NEXT_PUBLIC_MAPBOX_TOKEN}
+                process.env.NEXT_PUBLIC_MAPBOX_TOKEN
+              }
             >
               <Source id="radius-source" type="geojson" data={radiusGeoJSON}>
                 <Layer
