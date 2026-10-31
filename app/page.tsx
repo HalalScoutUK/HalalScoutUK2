@@ -390,28 +390,28 @@ export default function UKHalalAppMapbox() {
   const activeRestaurant =
     restaurants.find((r) => r.id === activeRestaurantId) || null;
 
-  const [editForm, setEditForm] = useState({
-    shopFront: '',
-    interior: '',
-    food: '',
-    menu: '',
-    certIssuer: '',
-    certNumber: '',
-  });
+    const [editForm, setEditForm] = useState({
+      shopFront: "",
+      interior: "",
+      food: "",
+      menu: "",
+      certIssuer: "",
+      certificateLink: "", // Add this property here
+    });
 
-  useEffect(() => {
-    if (activeRestaurant) {
-      setEditForm({
-        shopFront: activeRestaurant.media?.SHOP_FRONT || '',
-        interior: activeRestaurant.media?.INTERIOR || '',
-        food: activeRestaurant.media?.FOOD || '',
-        menu: activeRestaurant.media?.MENU || '',
-        certIssuer: activeRestaurant.certificateIssuer || '',
-        certNumber: activeRestaurant.certificateNumber || '',
-      });
-      setReviewError('');
-    }
-  }, [activeRestaurantId]);
+    useEffect(() => {
+      if (activeRestaurant) {
+        setEditForm({
+          shopFront: activeRestaurant.media?.SHOP_FRONT || "",
+          interior: activeRestaurant.media?.INTERIOR || "",
+          food: activeRestaurant.media?.FOOD || "",
+          menu: activeRestaurant.media?.MENU || "",
+          certIssuer: activeRestaurant.certificateIssuer || "",
+          certificateLink: activeRestaurant.certificateLink || "", // Map it here
+        });
+        setReviewError("");
+      }
+    }, [activeRestaurantId]);
 
   const handleResetToCurrentLocation = () => {
     if ('geolocation' in navigator) {
