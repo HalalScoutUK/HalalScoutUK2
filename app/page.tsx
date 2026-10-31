@@ -51,6 +51,18 @@ function calculateDistanceMiles(lat1: number, lon1: number, lat2: number, lon2: 
   return R * c;
 }
 
+function getUserTier(points: number) {
+  if (points >= 1000) {
+    return { title: "Trusted Scout", badge: "⭐ Trusted Scout", color: "bg-amber-400/20 text-amber-300 border-amber-400/40" };
+  } else if (points >= 500) {
+    return { title: "Gold Scout", badge: "🥇 Gold Scout", color: "bg-amber-400/20 text-amber-300 border-amber-400/40" };
+  } else if (points >= 200) {
+    return { title: "Silver Scout", badge: "🥈 Silver Scout", color: "bg-slate-300/20 text-slate-200 border-slate-400/40" };
+  } else {
+    return { title: "Novice Scout", badge: "🥉 Novice Scout", color: "bg-emerald-500/20 text-emerald-300 border-emerald-500/40" };
+  }
+}
+
 function getAverageRating(reviews: any[]) {
   if (!reviews || reviews.length === 0) return null;
   const sum = reviews.reduce((acc, r) => acc + (r.rating || 5), 0);
@@ -717,14 +729,12 @@ export default function UKHalalAppMapbox() {
           </div>
         </div>
 
-        {/* STICKY QUICK-FILTER PILL BAR (Stretched Full-Width with Sliding Animation) */}
+        {/* STICKY QUICK-FILTER PILL BAR (Compact layout with exact requested filter texts) */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-3 sm:p-4 shadow-lg space-y-3">
-          <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
-            
-            {/* Radius Section: Stretched Full-Width */}
-            <div className="flex items-center gap-2.5 w-full sm:w-auto flex-1">
-              <span className="text-[11px] sm:text-xs font-bold uppercase tracking-wider text-slate-300 shrink-0">Radius:</span>
-              <div className="grid grid-cols-3 bg-slate-800 p-1 rounded-xl text-[11px] sm:text-xs border border-slate-700 w-full relative">
+          <div className="flex flex-wrap items-center justify-between gap-2.5">
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] sm:text-xs font-bold uppercase tracking-wider text-slate-300">Radius:</span>
+              <div className="flex bg-slate-800 p-1 rounded-xl text-[11px] sm:text-xs gap-1 border border-slate-700">
                 {[
                   { label: "Local", val: 0.5 },
                   { label: "1 mile", val: 1 },
@@ -733,10 +743,8 @@ export default function UKHalalAppMapbox() {
                   <button
                     key={item.val}
                     onClick={() => setMaxDistanceMiles(item.val)}
-                    className={`relative z-10 py-1.5 px-2 rounded-lg font-semibold text-center transition-all duration-300 ease-in-out ${
-                      maxDistanceMiles === item.val
-                        ? "text-slate-950 font-bold bg-emerald-500 shadow-md scale-[1.02]"
-                        : "text-slate-400 hover:text-white"
+                    className={`px-2.5 py-1 rounded-lg font-semibold transition ${
+                      maxDistanceMiles === item.val ? "bg-emerald-500 text-slate-950 shadow" : "text-slate-400 hover:text-white"
                     }`}
                   >
                     {item.label}
@@ -746,7 +754,7 @@ export default function UKHalalAppMapbox() {
             </div>
 
             {/* Compact Category & Saved Filter Pills */}
-            <div className="flex flex-wrap gap-1 text-[11px] sm:text-xs w-full sm:w-auto justify-start sm:justify-end">
+            <div className="flex flex-wrap gap-1 text-[11px] sm:text-xs">
               {[
                 { id: "ALL", label: "All" },
                 { id: "HMC_CERTIFIED", label: "HMC" },
@@ -767,7 +775,6 @@ export default function UKHalalAppMapbox() {
                 </button>
               ))}
             </div>
-
           </div>
         </div>
 
@@ -1151,42 +1158,40 @@ export default function UKHalalAppMapbox() {
                 <h4 className="font-bold text-white text-base">@{username || "scout"}</h4>
                 <p className="text-xs text-slate-400">{user.email}</p>
                 <div className="flex items-center justify-between pt-1">
-                  <span className="text-[10px] bg-amber-400/20 text-amber-300 font-bold px-2 py-0.5 rounded border border-amber-400/40">
-                    {myTotalThumbsUp >= 1000 ? "⭐ Trusted Scout" : "🥇 Gold Scout"}
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${getUserTier(myPoints).color}`}>
+                  {getUserTier(myPoints).badge}
                   </span>
-                  <span className="text-[10px] text-emerald-400 font-mono font-bold">
-                    Rank #4 in UK
-                  </span>
+                <span className="text-[10px] text-emerald-400 font-mono font-bold">
+                   Rank #4 in UK
+                 </span>
                 </div>
               </div>
             </div>
 
-            {/* Tier Progress Bar */}
-            <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800 space-y-2">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-slate-300 font-semibold flex items-center gap-1.5">
-                  <Trophy className="w-3.5 h-3.5 text-amber-400" /> Progress to Trusted Scout (1,000 pts)
-                </span>
-                <span className="text-emerald-400 font-mono font-bold">{myPoints} / 1000 pts</span>
-              </div>
-              <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
-                <div 
-                  className="bg-gradient-to-r from-emerald-500 to-teal-400 h-full rounded-full transition-all duration-500"
-                  style={{ width: `${Math.min(100, (myPoints / 1000) * 100)}%` }}
-                ></div>
-              </div>
-            </div>
+            {/* Dynamic Tier Progress */}
+{(() => {
+  const currentTierPoints = myPoints < 200 ? myPoints : myPoints < 500 ? myPoints - 200 : myPoints < 1000 ? myPoints - 500 : 1000;
+  const targetPoints = myPoints < 200 ? 200 : myPoints < 500 ? 300 : myPoints < 1000 ? 500 : 1000;
+  const progressPercent = Math.min(100, (currentTierPoints / targetPoints) * 100);
+  const nextTierName = myPoints < 200 ? "Silver Scout (200 pts)" : myPoints < 500 ? "Gold Scout (500 pts)" : myPoints < 1000 ? "Trusted Scout (1,000 pts)" : "Max Rank Reached ⭐";
 
-            <div className="grid grid-cols-2 gap-3 text-center">
-              <div className="bg-slate-950 p-3 rounded-xl border border-slate-800">
-                <span className="text-xs text-slate-400 block">Total Points</span>
-                <span className="text-lg font-black text-emerald-400">{myPoints} pts</span>
-              </div>
-              <div className="bg-slate-950 p-3 rounded-xl border border-slate-800">
-                <span className="text-xs text-slate-400 block">Saved Favorites</span>
-                <span className="text-lg font-black text-rose-400">{favorites.length} spots</span>
-              </div>
-            </div>
+  return (
+    <div className="bg-slate-950 p-3.5 rounded-xl border border-slate-800 space-y-2">
+      <div className="flex items-center justify-between text-xs">
+        <span className="text-slate-300 font-semibold flex items-center gap-1.5">
+          <Trophy className="w-3.5 h-3.5 text-amber-400" /> Progress to {nextTierName}
+        </span>
+        <span className="text-emerald-400 font-mono font-bold">{myPoints} pts</span>
+      </div>
+      <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+        <div 
+          className="bg-gradient-to-r from-emerald-500 to-teal-400 h-full rounded-full transition-all duration-500"
+          style={{ width: `${progressPercent}%` }}
+        ></div>
+      </div>
+    </div>
+  );
+})()}
 
             {/* Halal Passport / Stamp Book */}
             <div className="space-y-2 pt-1">
