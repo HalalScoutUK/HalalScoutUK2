@@ -1581,35 +1581,41 @@ export default function UKHalalAppMapbox() {
             </div>
 
             {/* Bookmarked Favorites List */}
-            <div className="space-y-2 pt-1">
-              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
-                <Bookmark className="w-3.5 h-3.5 text-emerald-400" /> Bookmarked
-                Favorites ({favorites.length})
-              </h4>
-              <div className="max-h-28 overflow-y-auto space-y-1.5">
-                {favorites.length > 0 ? (
-                  favorites.map((favId) => {
-                    const r = restaurants.find((item) => item.id === favId);
-                    if (!r) return null;
-                    return (
-                      <div
-                        key={favId}
-                        className="bg-slate-950 px-3 py-2 rounded-lg text-xs text-slate-300 flex items-center justify-between border border-slate-800/80"
-                      >
-                        <span className="font-semibold text-white">
-                          {r.name}
-                        </span>
-                        <span className="text-slate-400">{r.city}</span>
-                      </div>
-                    );
-                  })
-                ) : (
-                  <p className="text-xs text-slate-500 text-center py-3">
-                    No saved favorites yet.
-                  </p>
-                )}
-              </div>
-            </div>
+<div className="space-y-2 pt-1">
+  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+    <Bookmark className="w-3.5 h-3.5 text-emerald-400" /> Bookmarked Favorites ({favorites.length})
+  </h4>
+  <div className="max-h-28 overflow-y-auto space-y-1.5">
+    {favorites.length > 0 ? (
+      favorites.map((favId) => {
+        const r = restaurants.find((item) => item.id === favId);
+        if (!r) return null;
+        return (
+          <div
+            key={favId}
+            onClick={() => {
+              setActiveRestaurantId(r.id);
+              setUserLocation({ latitude: r.lat, longitude: r.lng });
+              setViewState((prev) => ({
+                ...prev,
+                latitude: r.lat,
+                longitude: r.lng,
+                zoom: 15,
+              }));
+              setShowProfileModal(false); // Close the profile modal so they can see the restaurant
+            }}
+            className="bg-slate-950 px-3 py-2 rounded-lg text-xs text-slate-300 flex items-center justify-between border border-slate-800/80 hover:border-emerald-500/50 hover:bg-slate-900 cursor-pointer transition shadow-inner group"
+          >
+            <span className="font-semibold text-white group-hover:text-emerald-400 transition">{r.name}</span>
+            <span className="text-slate-400 font-mono text-[11px]">{r.city}</span>
+          </div>
+        );
+      })
+    ) : (
+      <p className="text-xs text-slate-500 text-center py-3">No saved favorites yet.</p>
+    )}
+  </div>
+</div>
 
             <div className="pt-2">
               <button
