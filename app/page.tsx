@@ -169,6 +169,8 @@ export default function UKHalalAppMapbox() {
   const [showOwnerVerifyModal, setShowOwnerVerifyModal] = useState(false);
   const [certInput, setCertInput] = useState('');
   const [verifyError, setVerifyError] = useState('');
+  const [claimCodeInput, setClaimCodeInput] = useState('');
+  const [claimError, setClaimError] = useState('');
 
   const [showCertModal, setShowCertModal] = useState(false);
   const [showOwnerModal, setShowOwnerModal] = useState(false);
@@ -1955,6 +1957,85 @@ export default function UKHalalAppMapbox() {
                 className="px-4 py-2 rounded-lg bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300 shadow"
               >
                 Save Changes
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* OWNER CLAIM CODE VERIFICATION MODAL */}
+      {showOwnerVerifyModal && !isVerifiedOwner && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="font-bold text-base text-white flex items-center gap-2">
+                <Store className="w-5 h-5 text-amber-400" /> Claim Restaurant Ownership
+              </h3>
+              <button onClick={() => setShowOwnerVerifyModal(false)} className="text-xs text-slate-400 hover:text-white">
+                Close ✕
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-300">
+              Enter the unique claim code provided by HMC or your restaurant administrator to unlock the management portal for your shop.
+            </p>
+
+            <div className="space-y-3 pt-2">
+              <input
+                type="text"
+                placeholder="e.g. A3F9K2"
+                value={claimCodeInput}
+                onChange={(e) => setClaimCodeInput(e.target.value.toUpperCase())}
+                className="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-white font-mono tracking-widest text-center text-lg uppercase"
+              />
+              {claimError && <p className="text-rose-400 text-xs text-center font-medium">{claimError}</p>}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
+              <button
+                onClick={() => setShowOwnerVerifyModal(false)}
+                className="px-4 py-2 rounded-xl bg-slate-800 text-slate-300 text-xs font-semibold hover:bg-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  if (!claimCodeInput.trim() || !user) return;
+
+                  const { data: matchedRest, error: fetchError } = await supabase
+                    .from("restaurants")
+                    .select("*")
+                    .eq("owner_claim_code", claimCodeInput.trim())
+                    .single();
+
+                  if (fetchError || !matchedRest) {
+                    setClaimError("Invalid claim code. Please check and try again.");
+                    return;
+                  }
+
+                  if (matchedRest.owner_id && matchedRest.owner_id !== user.id) {
+                    setClaimError("This restaurant has already been claimed by another owner.");
+                    return;
+                  }
+
+                  const { error: updateError } = await supabase
+                    .from("restaurants")
+                    .update({ owner_id: user.id })
+                    .eq("id", matchedRest.id);
+
+                  if (updateError) {
+                    setClaimError("Failed to claim restaurant. Please try again.");
+                    return;
+                  }
+
+                  setIsVerifiedOwner(true);
+                  setRole("OWNER");
+                  setShowOwnerVerifyModal(false);
+                  alert(`Successfully claimed ${matchedRest.name}! Welcome to your Owner Portal.`);
+                }}
+                className="px-4 py-2 rounded-xl bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300 shadow"
+              >
+                Verify & Unlock Portal
               </button>
             </div>
           </div>
