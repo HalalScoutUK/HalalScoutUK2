@@ -220,6 +220,7 @@ export default function UKHalalAppMapbox() {
   }, [selectedFilter]);
 
   async function checkUserProfile(userId: string) {
+    // 1. Fetch user profile and username
     const { data, error } = await supabase
       .from('profiles')
       .select('username, points')
@@ -231,6 +232,17 @@ export default function UKHalalAppMapbox() {
     } else {
       setUsername(data.username);
       if (data.points != null) setMyPoints(data.points);
+    }
+
+    // 2. CHECK IF THIS USER OWNS ANY RESTAURANT IN SUPABASE
+    const { data: ownedRest, error: ownerError } = await supabase
+      .from('restaurants')
+      .select('id')
+      .eq('owner_id', userId)
+      .maybeSingle();
+
+    if (!ownerError && ownedRest) {
+      setIsVerifiedOwner(true); // Automatically unlocks owner status on login!
     }
   }
 
@@ -392,28 +404,28 @@ export default function UKHalalAppMapbox() {
   const activeRestaurant =
     restaurants.find((r) => r.id === activeRestaurantId) || null;
 
-    const [editForm, setEditForm] = useState({
-      shopFront: "",
-      interior: "",
-      food: "",
-      menu: "",
-      certIssuer: "",
-      certificateLink: "", // Add this property here
-    });
+  const [editForm, setEditForm] = useState({
+    shopFront: '',
+    interior: '',
+    food: '',
+    menu: '',
+    certIssuer: '',
+    certificateLink: '', // Add this property here
+  });
 
-    useEffect(() => {
-      if (activeRestaurant) {
-        setEditForm({
-          shopFront: activeRestaurant.media?.SHOP_FRONT || "",
-          interior: activeRestaurant.media?.INTERIOR || "",
-          food: activeRestaurant.media?.FOOD || "",
-          menu: activeRestaurant.media?.MENU || "",
-          certIssuer: activeRestaurant.certificateIssuer || "",
-          certificateLink: activeRestaurant.certificateLink || "", // Map it here
-        });
-        setReviewError("");
-      }
-    }, [activeRestaurantId]);
+  useEffect(() => {
+    if (activeRestaurant) {
+      setEditForm({
+        shopFront: activeRestaurant.media?.SHOP_FRONT || '',
+        interior: activeRestaurant.media?.INTERIOR || '',
+        food: activeRestaurant.media?.FOOD || '',
+        menu: activeRestaurant.media?.MENU || '',
+        certIssuer: activeRestaurant.certificateIssuer || '',
+        certificateLink: activeRestaurant.certificateLink || '', // Map it here
+      });
+      setReviewError('');
+    }
+  }, [activeRestaurantId]);
 
   const handleResetToCurrentLocation = () => {
     if ('geolocation' in navigator) {
@@ -771,9 +783,7 @@ export default function UKHalalAppMapbox() {
                 left: 0,
               }}
               mapStyle="mapbox://styles/mapbox/dark-v11"
-              mapboxAccessToken={
-                process.env.NEXT_PUBLIC_MAPBOX_TOKEN
-              }
+              mapboxAccessToken={process.env.NEXT_PUBLIC_MAPBOX_TOKEN}
             >
               <Source id="radius-source" type="geojson" data={radiusGeoJSON}>
                 <Layer
@@ -881,7 +891,231 @@ export default function UKHalalAppMapbox() {
                 ))}
               </div>
             </div>
+            {/* MAIN CONTENT AREA */}
+            <main className="max-w-6xl mx-auto px-4 pt-6 space-y-6">
+              {role === 'OWNER' ? (
+                /* ========================================================= */
+                /* OWNER DASHBOARD VIEW                                      */
+                /* ========================================================= */
+                <div className="space-y-6">
+                  {(() => {
+                    // Find the restaurant owned by the current user
+                    const ownedRestaurant = restaurants.find(
+                      (r) => r.owner_id === user?.id
+                    );
 
+                    if (!ownedRestaurant) {
+                      return (
+                        <div className="bg-slate-900 border border-amber-500/30 rounded-2xl p-12 text-center space-y-3 shadow-2xl">
+                          <div className="w-12 h-12 rounded-full bg-amber-400/10 border border-amber-400/30 flex items-center justify-center text-amber-400 mx-auto">
+                            <Store className="w-6 h-6" />
+                          </div>
+                          <h3 className="text-base font-bold text-white">
+                            No Restaurant Linked
+                          </h3>
+                          <p className="text-xs text-slate-400 max-w-sm mx-auto">
+                            You haven't claimed a restaurant yet. Use your
+                            unique HMC claim code to link your account to your
+                            shop.
+                          </p>
+                          <button
+                            onClick={() => setShowOwnerVerifyModal(true)}
+                            className="bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs transition shadow"
+                          >
+                            Enter Claim Code 🔑
+                          </button>
+                        </div>
+                      );
+                    }
+
+                    const avgRating = getAverageRating(ownedRestaurant.reviews);
+
+                    return (
+                      <div className="space-y-6">
+                        {/* Owner Dashboard Header Banner */}
+                        <div className="bg-gradient-to-r from-amber-500/10 via-slate-900 to-slate-900 border border-amber-500/30 rounded-2xl p-6 shadow-2xl flex flex-wrap items-center justify-between gap-4">
+                          <div className="space-y-1">
+                            <div className="flex items-center gap-2">
+                              <span className="bg-amber-400 text-slate-950 text-[10px] font-black px-2 py-0.5 rounded uppercase">
+                                Verified Owner Portal
+                              </span>
+                              <span className="text-xs text-slate-400 font-mono">
+                                Claim Code:{' '}
+                                {ownedRestaurant.owner_claim_code || 'LINKED'}
+                              </span>
+                            </div>
+                            <h1 className="text-2xl font-black text-white">
+                              {ownedRestaurant.name}
+                            </h1>
+                            <p className="text-xs text-slate-400">
+                              {ownedRestaurant.city}, {ownedRestaurant.postcode}{' '}
+                              • {ownedRestaurant.phone || 'No phone listed'}
+                            </p>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            <button
+                              onClick={() => {
+                                setActiveRestaurantId(ownedRestaurant.id);
+                                setShowOwnerModal(true);
+                              }}
+                              className="bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold px-4 py-2.5 rounded-xl text-xs transition shadow flex items-center gap-2"
+                            >
+                              <Store className="w-4 h-4" /> Edit Profile &
+                              Photos
+                            </button>
+                          </div>
+                        </div>
+
+                        {/* Quick Metrics Grid */}
+                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-1 shadow-xl">
+                            <p className="text-xs font-semibold text-slate-400">
+                              Live Community Rating
+                            </p>
+                            <div className="flex items-center gap-2">
+                              <span className="text-2xl font-black text-white">
+                                {avgRating || 'New'}
+                              </span>
+                              {avgRating && (
+                                <Star className="w-5 h-5 text-amber-400 fill-amber-400" />
+                              )}
+                            </div>
+                            <p className="text-[11px] text-slate-500">
+                              Based on verified user feedback
+                            </p>
+                          </div>
+
+                          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-1 shadow-xl">
+                            <p className="text-xs font-semibold text-slate-400">
+                              Total User Reviews
+                            </p>
+                            <p className="text-2xl font-black text-white">
+                              {ownedRestaurant.reviews?.length || 0}
+                            </p>
+                            <p className="text-[11px] text-slate-500">
+                              Customer feedback history
+                            </p>
+                          </div>
+
+                          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-1 shadow-xl">
+                            <p className="text-xs font-semibold text-slate-400">
+                              Halal Certification
+                            </p>
+                            <p className="text-sm font-bold text-emerald-400 truncate pt-1">
+                              {ownedRestaurant.certificateIssuer}
+                            </p>
+                            <a
+                              href={
+                                ownedRestaurant.certificateLink ||
+                                ownedRestaurant.website ||
+                                'https://halalhmc.org/outlets/'
+                              }
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-[11px] text-sky-400 hover:underline inline-flex items-center gap-1 pt-0.5"
+                            >
+                              View Official Registry ↗
+                            </a>
+                          </div>
+                        </div>
+
+                        {/* Owner Media Preview & Management Card */}
+                        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4 shadow-2xl">
+                          <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                            <ImageIcon className="w-4 h-4 text-amber-400" />{' '}
+                            Current Storefront & Food Showcase
+                          </h3>
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                            <div className="space-y-1.5">
+                              <span className="text-xs text-slate-400 font-medium">
+                                Shop Front
+                              </span>
+                              <div className="h-40 w-full rounded-xl border border-slate-800 bg-slate-950 overflow-hidden flex items-center justify-center">
+                                {ownedRestaurant.media?.SHOP_FRONT ? (
+                                  <img
+                                    src={ownedRestaurant.media.SHOP_FRONT}
+                                    alt="Shop Front"
+                                    className="w-full h-full object-cover"
+                                  />
+                                ) : (
+                                  <span className="text-xs text-slate-600">
+                                    No shop front photo uploaded
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+
+                            <div className="space-y-1.5">
+                              <span className="text-xs text-slate-400 font-medium">
+                                Food Shot
+                              </span>
+                              <div className="h-40 w-full rounded-xl border border-slate-800 bg-slate-950 overflow-hidden flex items-center justify-center">
+                                {ownedRestaurant.media?.FOOD ? (
+                                  <img
+                                    src={ownedRestaurant.media.FOOD}
+                                    alt="Food Shot"
+                                    className="w-full h-full object-cover"
+                                  />
+                                ) : (
+                                  <span className="text-xs text-slate-600">
+                                    No food photo uploaded
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Customer Reviews Feed for Owner */}
+                        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4 shadow-2xl">
+                          <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                            <MessageSquare className="w-4 h-4 text-emerald-400" />{' '}
+                            Customer Feedback & Reviews
+                          </h3>
+                          <div className="space-y-3">
+                            {ownedRestaurant.reviews &&
+                            ownedRestaurant.reviews.length > 0 ? (
+                              ownedRestaurant.reviews.map((rev: any) => (
+                                <div
+                                  key={rev.id || rev.created_at}
+                                  className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2"
+                                >
+                                  <div className="flex items-center justify-between">
+                                    <span className="font-bold text-xs text-white">
+                                      @{rev.userName || rev.user_name}
+                                    </span>
+                                    <span className="flex items-center gap-1 bg-amber-400/20 text-amber-300 text-[10px] font-bold px-2 py-0.5 rounded border border-amber-400/40">
+                                      <Star className="w-3 h-3 fill-current" />{' '}
+                                      {rev.rating} / 5
+                                    </span>
+                                  </div>
+                                  <p className="text-xs text-slate-300">
+                                    {rev.comment}
+                                  </p>
+                                </div>
+                              ))
+                            ) : (
+                              <p className="text-xs text-slate-500 text-center py-6">
+                                No reviews for your restaurant yet.
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+              ) : (
+                /* ========================================================= */
+                /* STANDARD USER DISCOVERY & MAP VIEW                        */
+                /* ========================================================= */
+                <div className="space-y-6">
+                  {/* Existing Map & List components remain here */}
+                  ...
+                </div>
+              )}
+            </main>
             {/* Compact Category & Saved Filter Pills */}
             <div className="flex flex-wrap gap-1 text-[11px] sm:text-xs">
               {[
@@ -1583,41 +1817,51 @@ export default function UKHalalAppMapbox() {
             </div>
 
             {/* Bookmarked Favorites List */}
-<div className="space-y-2 pt-1">
-  <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
-    <Bookmark className="w-3.5 h-3.5 text-emerald-400" /> Bookmarked Favorites ({favorites.length})
-  </h4>
-  <div className="max-h-28 overflow-y-auto space-y-1.5">
-    {favorites.length > 0 ? (
-      favorites.map((favId) => {
-        const r = restaurants.find((item) => item.id === favId);
-        if (!r) return null;
-        return (
-          <div
-            key={favId}
-            onClick={() => {
-              setActiveRestaurantId(r.id);
-              setUserLocation({ latitude: r.lat, longitude: r.lng });
-              setViewState((prev) => ({
-                ...prev,
-                latitude: r.lat,
-                longitude: r.lng,
-                zoom: 15,
-              }));
-              setShowProfileModal(false); // Close the profile modal so they can see the restaurant
-            }}
-            className="bg-slate-950 px-3 py-2 rounded-lg text-xs text-slate-300 flex items-center justify-between border border-slate-800/80 hover:border-emerald-500/50 hover:bg-slate-900 cursor-pointer transition shadow-inner group"
-          >
-            <span className="font-semibold text-white group-hover:text-emerald-400 transition">{r.name}</span>
-            <span className="text-slate-400 font-mono text-[11px]">{r.city}</span>
-          </div>
-        );
-      })
-    ) : (
-      <p className="text-xs text-slate-500 text-center py-3">No saved favorites yet.</p>
-    )}
-  </div>
-</div>
+            <div className="space-y-2 pt-1">
+              <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                <Bookmark className="w-3.5 h-3.5 text-emerald-400" /> Bookmarked
+                Favorites ({favorites.length})
+              </h4>
+              <div className="max-h-28 overflow-y-auto space-y-1.5">
+                {favorites.length > 0 ? (
+                  favorites.map((favId) => {
+                    const r = restaurants.find((item) => item.id === favId);
+                    if (!r) return null;
+                    return (
+                      <div
+                        key={favId}
+                        onClick={() => {
+                          setActiveRestaurantId(r.id);
+                          setUserLocation({
+                            latitude: r.lat,
+                            longitude: r.lng,
+                          });
+                          setViewState((prev) => ({
+                            ...prev,
+                            latitude: r.lat,
+                            longitude: r.lng,
+                            zoom: 15,
+                          }));
+                          setShowProfileModal(false); // Close the profile modal so they can see the restaurant
+                        }}
+                        className="bg-slate-950 px-3 py-2 rounded-lg text-xs text-slate-300 flex items-center justify-between border border-slate-800/80 hover:border-emerald-500/50 hover:bg-slate-900 cursor-pointer transition shadow-inner group"
+                      >
+                        <span className="font-semibold text-white group-hover:text-emerald-400 transition">
+                          {r.name}
+                        </span>
+                        <span className="text-slate-400 font-mono text-[11px]">
+                          {r.city}
+                        </span>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <p className="text-xs text-slate-500 text-center py-3">
+                    No saved favorites yet.
+                  </p>
+                )}
+              </div>
+            </div>
 
             <div className="pt-2">
               <button
@@ -1936,7 +2180,31 @@ export default function UKHalalAppMapbox() {
                 Cancel
               </button>
               <button
-                onClick={() => {
+                onClick={async () => {
+                  if (!activeRestaurant || !user) return;
+
+                  // 1. Update Supabase Database
+                  const { error } = await supabase
+                    .from('restaurants')
+                    .update({
+                      certificate_link: editForm.certificateLink,
+                      media: {
+                        ...activeRestaurant.media,
+                        SHOP_FRONT: editForm.shopFront,
+                        FOOD: editForm.food,
+                      },
+                    })
+                    .eq('id', activeRestaurant.id)
+                    .eq('owner_id', user.id); // Extra security check: ensures only the true owner updates it
+
+                  if (error) {
+                    alert(
+                      'Failed to update restaurant profile: ' + error.message
+                    );
+                    return;
+                  }
+
+                  // 2. Update Local State
                   setRestaurants((prev) =>
                     prev.map((r: any) =>
                       r.id === activeRestaurant.id
@@ -1952,7 +2220,11 @@ export default function UKHalalAppMapbox() {
                         : r
                     )
                   );
+
                   setShowOwnerModal(false);
+                  alert(
+                    'Restaurant details successfully updated and saved to Supabase!'
+                  );
                 }}
                 className="px-4 py-2 rounded-lg bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300 shadow"
               >
@@ -1969,15 +2241,20 @@ export default function UKHalalAppMapbox() {
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <h3 className="font-bold text-base text-white flex items-center gap-2">
-                <Store className="w-5 h-5 text-amber-400" /> Claim Restaurant Ownership
+                <Store className="w-5 h-5 text-amber-400" /> Claim Restaurant
+                Ownership
               </h3>
-              <button onClick={() => setShowOwnerVerifyModal(false)} className="text-xs text-slate-400 hover:text-white">
+              <button
+                onClick={() => setShowOwnerVerifyModal(false)}
+                className="text-xs text-slate-400 hover:text-white"
+              >
                 Close ✕
               </button>
             </div>
 
             <p className="text-xs text-slate-300">
-              Enter the unique claim code provided by HMC or your restaurant administrator to unlock the management portal for your shop.
+              Enter the unique claim code provided by HMC or your restaurant
+              administrator to unlock the management portal for your shop.
             </p>
 
             <div className="space-y-3 pt-2">
@@ -1985,10 +2262,16 @@ export default function UKHalalAppMapbox() {
                 type="text"
                 placeholder="e.g. A3F9K2"
                 value={claimCodeInput}
-                onChange={(e) => setClaimCodeInput(e.target.value.toUpperCase())}
+                onChange={(e) =>
+                  setClaimCodeInput(e.target.value.toUpperCase())
+                }
                 className="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-3 text-white font-mono tracking-widest text-center text-lg uppercase"
               />
-              {claimError && <p className="text-rose-400 text-xs text-center font-medium">{claimError}</p>}
+              {claimError && (
+                <p className="text-rose-400 text-xs text-center font-medium">
+                  {claimError}
+                </p>
+              )}
             </div>
 
             <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
@@ -2002,36 +2285,48 @@ export default function UKHalalAppMapbox() {
                 onClick={async () => {
                   if (!claimCodeInput.trim() || !user) return;
 
-                  const { data: matchedRest, error: fetchError } = await supabase
-                    .from("restaurants")
-                    .select("*")
-                    .eq("owner_claim_code", claimCodeInput.trim())
-                    .single();
+                  const { data: matchedRest, error: fetchError } =
+                    await supabase
+                      .from('restaurants')
+                      .select('*')
+                      .eq('owner_claim_code', claimCodeInput.trim())
+                      .single();
 
                   if (fetchError || !matchedRest) {
-                    setClaimError("Invalid claim code. Please check and try again.");
+                    setClaimError(
+                      'Invalid claim code. Please check and try again.'
+                    );
                     return;
                   }
 
-                  if (matchedRest.owner_id && matchedRest.owner_id !== user.id) {
-                    setClaimError("This restaurant has already been claimed by another owner.");
+                  if (
+                    matchedRest.owner_id &&
+                    matchedRest.owner_id !== user.id
+                  ) {
+                    setClaimError(
+                      'This restaurant has already been claimed by another owner.'
+                    );
                     return;
                   }
 
                   const { error: updateError } = await supabase
-                    .from("restaurants")
+                    .from('restaurants')
                     .update({ owner_id: user.id })
-                    .eq("id", matchedRest.id);
+                    .eq('id', matchedRest.id);
 
                   if (updateError) {
-                    setClaimError("Failed to claim restaurant. Please try again.");
+                    setClaimError(
+                      'Failed to claim restaurant. Please try again.'
+                    );
                     return;
                   }
 
                   setIsVerifiedOwner(true);
-                  setRole("OWNER");
+                  setRole('OWNER');
                   setShowOwnerVerifyModal(false);
-                  alert(`Successfully claimed ${matchedRest.name}! Welcome to your Owner Portal.`);
+                  alert(
+                    `Successfully claimed ${matchedRest.name}! Welcome to your Owner Portal.`
+                  );
                 }}
                 className="px-4 py-2 rounded-xl bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300 shadow"
               >
