@@ -186,7 +186,6 @@ export default function UKHalalAppMapbox() {
     zoom: 14.2,
   });
   const [locationStatus, setLocationStatus] = useState('Detecting GPS...');
-
   const [restaurants, setRestaurants] = useState<any[]>([]);
   const [activeRestaurantId, setActiveRestaurantId] = useState<number | null>(
     null
@@ -395,14 +394,15 @@ export default function UKHalalAppMapbox() {
 
   useEffect(() => {
     async function fetchRestaurants() {
-      const { data, error } = await supabase
-        .from('restaurants')
-        .select(RESTAURANT_COLUMNS);
+      const { data, error } = await supabase.from('restaurants').select('*');
+      console.log('restaurants result', { count: data?.length, error });
+    
       if (error) {
         console.error('Error fetching restaurants:', error.message);
-        setNotice('Could not load restaurants. Please refresh.');
+        setNotice('Could not load restaurants: ' + error.message);
         return;
       }
+      // ...rest of the function stays the same
       if (data && data.length > 0) {
         const formatted = (data as any[])
           .filter(
