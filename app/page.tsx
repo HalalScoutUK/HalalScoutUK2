@@ -27,6 +27,9 @@ import {
   User,
   Bookmark,
   MessageSquare,
+  CheckCircle2,
+  Flag,
+  ThumbsUp,
   Compass,
   Trophy,
 } from 'lucide-react';
@@ -45,27 +48,6 @@ const MEDIA_TABS: { key: MediaKey; label: string }[] = [
 ];
 
 const LONDON = { latitude: 51.5074, longitude: -0.1278 };
-
-// Columns fetched for every visitor. Deliberately excludes owner_claim_code
-// so claim codes are never sent to the browser. Adjust to match your table.
-const RESTAURANT_COLUMNS = [
-  'id',
-  'name',
-  'lat',
-  'lng',
-  'city',
-  'postcode',
-  'phone',
-  'website',
-  'halal_category',
-  'serves_alcohol',
-  'certificate_issuer',
-  'certificate_number',
-  'certificate_link',
-  'certification_valid_until',
-  'media',
-  'reviews',
-].join(',');
 
 function calculateDistanceMiles(
   lat1: number,
@@ -119,10 +101,42 @@ function getUserTier(points: number) {
   };
 }
 
-function getAverageRating(reviews: any[]) {
-  if (!reviews || reviews.length === 0) return null;
-  const sum = reviews.reduce((acc, r) => acc + (r.rating || 5), 0);
-  return (sum / reviews.length).toFixed(1);
+// Yes / No / Not sure chooser used in the review form
+function TriChoice({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: boolean | null;
+  onChange: (v: boolean | null) => void;
+}) {
+  const options: { text: string; v: boolean | null }[] = [
+    { text: 'Yes', v: true },
+    { text: 'No', v: false },
+    { text: 'Not sure', v: null },
+  ];
+  return (
+    <div className="space-y-1.5">
+      <p className="text-xs text-slate-300 font-medium">{label}</p>
+      <div className="flex gap-1.5">
+        {options.map((o) => (
+          <button
+            key={o.text}
+            type="button"
+            onClick={() => onChange(o.v)}
+            className={`px-3 py-1.5 rounded-lg text-xs font-semibold border transition ${
+              value === o.v
+                ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+                : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-white'
+            }`}
+          >
+            {o.text}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 
 function createGeoJSONCircle(
@@ -299,6 +313,16 @@ export default function UKHalalAppMapbox() {
   const [username, setUsername] = useState<string | null>(null);
   const [myPoints, setMyPoints] = useState(0);
   const [favorites, setFavorites] = useState<number[]>([]);
+  const [visited, setVisited] = useState<number[]>([]);
+  const [reviews, setReviews] = useState<any[]>([]);
+  const [reviewsVersion, setReviewsVersion] = useState(0);
+  const [showReviewModal, setShowReviewModal] = useState(false);
+  const [reviewRating, setReviewRating] = useState(5);
+  const [reviewComment, setReviewComment] = useState('');
+  const [reviewMeat, setReviewMeat] = useState<boolean | null>(null);
+  const [reviewPrayer, setReviewPrayer] = useState<boolean | null>(null);
+  const [reviewError, setReviewError] = useState('');
+  const [submittingReview, setSubmittingReview] = useState(false);
   const [ownedRestaurantIds, setOwnedRestaurantIds] = useState<number[]>([]);
 
   const [showAuthModal, setShowAuthModal] = useState(false);
@@ -390,9 +414,11 @@ export default function UKHalalAppMapbox() {
       setUser(u);
       if (u) {
         fetchFavorites(u.id);
+        fetchVisited();
         checkUserProfile(u.id);
       } else {
         setFavorites([]);
+        setVisited([]);
         setUsername(null);
         setOwnedRestaurantIds([]);
         setRole('USER');
@@ -418,17 +444,17 @@ export default function UKHalalAppMapbox() {
       return;
     }
 
-    // points is left out so an existing row's points are never reset
-    const { error } = await supabase.from('profiles').upsert({
-      id: user.id,
-      username: trimmed,
-      updated_at: new Date().toISOString(),
+    // Saved by a database function so users can never write their own points
+    const { error } = await supabase.rpc('set_username', {
+      p_username: trimmed,
     });
 
     if (error) {
       setUsernameError(
         error.code === '23505'
           ? 'This username is already taken. Please choose another.'
+          : error.message.includes('invalid_username')
+          ? 'Use 3-30 letters, numbers or underscores.'
           : error.message
       );
     } else {
@@ -496,13 +522,201 @@ export default function UKHalalAppMapbox() {
     }
   };
 
+  /* ------------------------- Community: visits & reviews ------------------------- */
+
+  async function fetchVisited() {
+    const { data, error } = await supabase
+      .from('check_ins')
+      .select('restaurant_id');
+    if (!error && data) setVisited(data.map((v: any) => v.restaurant_id));
+  }
+
+  async function refreshPoints(userId: string) {
+    const { data } = await supabase
+      .from('profiles')
+      .select('points')
+      .eq('id', userId)
+      .maybeSingle();
+    if (data?.points != null) setMyPoints(data.points);
+  }
+
+  async function fetchRatingStats() {
+    const { data } = await supabase.rpc('get_rating_stats');
+    const map: Record<number, { avg: string; count: number }> = {};
+    ((data as any[]) ?? []).forEach((s) => {
+      map[s.restaurant_id] = {
+        avg: Number(s.avg_rating).toFixed(1),
+        count: Number(s.review_count),
+      };
+    });
+    return map;
+  }
+
+  async function refreshRatings() {
+    const stats = await fetchRatingStats();
+    setRestaurants((prev) =>
+      prev.map((r) => ({
+        ...r,
+        avgRating: stats[r.id]?.avg ?? null,
+        reviewCount: stats[r.id]?.count ?? 0,
+      }))
+    );
+  }
+
+  const requireSignIn = () => {
+    setNotice('Please sign in to join the community.');
+    setAuthMode('SIGNIN');
+    setAuthError('');
+    setShowAuthModal(true);
+  };
+
+  const toggleVisited = async (restaurantId: number, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!user) {
+      requireSignIn();
+      return;
+    }
+    const wasVisited = visited.includes(restaurantId);
+    const { error } = await supabase.rpc(
+      wasVisited ? 'unmark_visited' : 'mark_visited',
+      { p_restaurant_id: restaurantId }
+    );
+    if (error) {
+      setNotice(
+        error.message.includes('owner_cannot_check_in')
+          ? "You can't check in at a shop you own."
+          : 'Could not update your visit. Please try again.'
+      );
+      return;
+    }
+    setVisited((prev) =>
+      wasVisited
+        ? prev.filter((id) => id !== restaurantId)
+        : [...prev, restaurantId]
+    );
+  };
+
+  const openReviewModal = () => {
+    if (!user) {
+      requireSignIn();
+      return;
+    }
+    const mine = reviews.find((r) => r.is_mine);
+    setReviewRating(mine?.rating ?? 5);
+    setReviewComment(mine?.comment ?? '');
+    setReviewMeat(mine?.meat_confirmed ?? null);
+    setReviewPrayer(mine?.prayer_space ?? null);
+    setReviewError('');
+    setShowReviewModal(true);
+  };
+
+  const handleSubmitReview = async () => {
+    if (!activeRestaurant || !user) return;
+    setSubmittingReview(true);
+    setReviewError('');
+    const { error } = await supabase.rpc('submit_review', {
+      p_restaurant_id: activeRestaurant.id,
+      p_rating: reviewRating,
+      p_comment: reviewComment.trim() || null,
+      p_meat_confirmed: reviewMeat,
+      p_prayer_space: reviewPrayer,
+    });
+    setSubmittingReview(false);
+
+    if (error) {
+      const m = error.message || '';
+      setReviewError(
+        m.includes('owner_cannot_review')
+          ? "You can't review a shop you own."
+          : m.includes('rate_limited')
+          ? 'You have posted a lot of reviews today. Please try again tomorrow.'
+          : m.includes('username_required')
+          ? 'Please choose a username first.'
+          : m.includes('restaurant_not_available')
+          ? 'This restaurant is not available for reviews.'
+          : 'Could not save your review. Please try again.'
+      );
+      return;
+    }
+
+    setShowReviewModal(false);
+    setNotice('Thanks! Your review is live.');
+    setReviewsVersion((v) => v + 1);
+    refreshRatings();
+    refreshPoints(user.id);
+  };
+
+  const handleDeleteReview = async (restaurantId: number) => {
+    if (!window.confirm('Delete your review?')) return;
+    const { error } = await supabase.rpc('delete_my_review', {
+      p_restaurant_id: restaurantId,
+    });
+    if (error) {
+      setNotice('Could not delete your review.');
+      return;
+    }
+    setReviewsVersion((v) => v + 1);
+    refreshRatings();
+  };
+
+  const handleReportReview = async (reviewId: number) => {
+    if (!user) {
+      requireSignIn();
+      return;
+    }
+    if (!window.confirm('Report this review to the moderators?')) return;
+    const { error } = await supabase.rpc('report_review', {
+      p_review_id: reviewId,
+      p_reason: 'reported by user',
+    });
+    setNotice(
+      error ? 'Could not send your report.' : 'Thanks, we will take a look.'
+    );
+  };
+
+  const handleToggleLike = async (rev: any) => {
+    if (!user) {
+      requireSignIn();
+      return;
+    }
+    if (rev.is_mine) return;
+    const { data, error } = await supabase.rpc('toggle_review_like', {
+      p_review_id: rev.id,
+    });
+    if (error) {
+      setNotice(
+        error.message.includes('cannot_like_own_review')
+          ? "You can't like your own review."
+          : 'Could not update your like. Please try again.'
+      );
+      return;
+    }
+    const nowLiked = data === true;
+    setReviews((prev) =>
+      prev.map((r) =>
+        r.id === rev.id
+          ? {
+              ...r,
+              liked_by_me: nowLiked,
+              like_count: Number(r.like_count || 0) + (nowLiked ? 1 : -1),
+            }
+          : r
+      )
+    );
+  };
+
   /* ------------------------- Restaurants ------------------------- */
 
   useEffect(() => {
     async function fetchRestaurants() {
-      const { data, error } = await supabase
-        .from('restaurants')
-        .select('*');
+      const [{ data, error }, stats] = await Promise.all([
+        supabase
+          .from('restaurants')
+          // Reads every column, so new columns never need an app change. Keep
+          // secrets (claim codes, user IDs) out of this table: it is public.
+          .select('*'),
+        fetchRatingStats(),
+      ]);
       if (error) {
         console.error('Error fetching restaurants:', error.message);
         setNotice('Could not load restaurants. Please refresh.');
@@ -518,12 +732,12 @@ export default function UKHalalAppMapbox() {
             ...r,
             halalCategory: r.halal_category || 'HMC_CERTIFIED',
             servesAlcohol: r.serves_alcohol ?? false,
-            certificateIssuer:
-              r.certificate_issuer || 'HMC (Halal Monitoring Committee UK)',
+            certificateIssuer: r.certificate_issuer || null,
             certificateNumber: r.certificate_number || null,
             certificateLink: r.certificate_link || '',
             media: r.media || {},
-            reviews: r.reviews || [],
+            avgRating: stats[r.id]?.avg ?? null,
+            reviewCount: stats[r.id]?.count ?? 0,
           }));
         setRestaurants(formatted);
       }
@@ -545,6 +759,27 @@ export default function UKHalalAppMapbox() {
 
   const ownedRestaurant =
     restaurants.find((r) => ownedRestaurantIds.includes(r.id)) || null;
+
+  // Reviews for whichever restaurant is open (owners see their own shop's)
+  const reviewsTargetId =
+    role === 'OWNER' ? ownedRestaurant?.id ?? null : activeRestaurantId;
+  const myReview = reviews.find((r) => r.is_mine) || null;
+
+  useEffect(() => {
+    setReviews([]);
+    if (reviewsTargetId == null) return;
+    let cancelled = false;
+    supabase
+      .rpc('get_restaurant_reviews', { p_restaurant_id: reviewsTargetId })
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        setReviews(error ? [] : ((data as any[]) ?? []));
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviewsTargetId, reviewsVersion]);
 
   // Who has access to this shop's owner portal (only owners can ask)
   useEffect(() => {
@@ -999,7 +1234,7 @@ export default function UKHalalAppMapbox() {
               </div>
             ) : (
               (() => {
-                const avgRating = getAverageRating(ownedRestaurant.reviews);
+                const avgRating = ownedRestaurant.avgRating;
                 return (
                   <div className="space-y-6">
                     {/* Header banner */}
@@ -1049,7 +1284,7 @@ export default function UKHalalAppMapbox() {
                           Total User Reviews
                         </p>
                         <p className="text-2xl font-black text-white">
-                          {ownedRestaurant.reviews?.length || 0}
+                          {ownedRestaurant.reviewCount || 0}
                         </p>
                         <p className="text-[11px] text-slate-500">
                           Customer feedback history
@@ -1175,15 +1410,15 @@ export default function UKHalalAppMapbox() {
                         Customer Feedback & Reviews
                       </h3>
                       <div className="space-y-3">
-                        {ownedRestaurant.reviews?.length > 0 ? (
-                          ownedRestaurant.reviews.map((rev: any, i: number) => (
+                        {reviews.length > 0 ? (
+                          reviews.map((rev: any) => (
                             <div
-                              key={rev.id || rev.created_at || i}
+                              key={rev.id}
                               className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2"
                             >
                               <div className="flex items-center justify-between">
                                 <span className="font-bold text-xs text-white">
-                                  @{rev.userName || rev.user_name}
+                                  @{rev.username}
                                 </span>
                                 <span className="flex items-center gap-1 bg-amber-400/20 text-amber-300 text-[10px] font-bold px-2 py-0.5 rounded border border-amber-400/40">
                                   <Star className="w-3 h-3 fill-current" />{' '}
@@ -1355,7 +1590,7 @@ export default function UKHalalAppMapbox() {
                       <div className="bg-slate-900 text-slate-100 border border-slate-700 p-1.5 pr-4 rounded-full shadow-2xl font-sans flex items-center gap-3">
                         <div className="h-7 px-2 rounded-full bg-amber-400/20 border border-amber-400/40 text-amber-300 flex items-center justify-center gap-1 font-bold text-xs shadow-inner">
                           <Star className="w-3.5 h-3.5 fill-current text-amber-400" />
-                          {getAverageRating(activeRestaurant.reviews) || 'New'}
+                          {activeRestaurant.avgRating || 'New'}
                         </div>
                         <span className="font-bold text-xs text-white tracking-tight">
                           {activeRestaurant.name}
@@ -1443,7 +1678,7 @@ export default function UKHalalAppMapbox() {
                         : getCategoryBadge(rest.halalCategory);
                     const isSelected = activeRestaurantId === rest.id;
                     const isFav = favorites.includes(rest.id);
-                    const avgRating = getAverageRating(rest.reviews);
+                    const avgRating = rest.avgRating;
 
                     return (
                       <div
@@ -1498,7 +1733,7 @@ export default function UKHalalAppMapbox() {
                               {avgRating ? (
                                 <span className="flex items-center gap-1 bg-amber-400/20 text-amber-300 text-xs font-bold px-2 py-0.5 rounded border border-amber-400/40">
                                   <Star className="w-3 h-3 fill-current" />{' '}
-                                  {avgRating} ({rest.reviews.length})
+                                  {avgRating} ({rest.reviewCount})
                                 </span>
                               ) : (
                                 <span className="text-[10px] bg-slate-800 text-slate-400 px-2 py-0.5 rounded border border-slate-700">
@@ -1629,6 +1864,153 @@ export default function UKHalalAppMapbox() {
                                 )}
                               </div>
                             </div>
+
+                            {/* Community: visits and reviews */}
+                            <div className="space-y-3 pt-3 border-t border-slate-800">
+                              {user && (
+                              <div className="flex flex-wrap gap-2">
+                                <button
+                                  onClick={(e) => toggleVisited(rest.id, e)}
+                                  className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border transition ${
+                                    visited.includes(rest.id)
+                                      ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+                                      : 'bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700'
+                                  }`}
+                                >
+                                  <CheckCircle2 className="w-3.5 h-3.5" />
+                                  {visited.includes(rest.id)
+                                    ? "I've eaten here"
+                                    : 'Mark as visited'}
+                                </button>
+                                <button
+                                  onClick={openReviewModal}
+                                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700 transition"
+                                >
+                                  <MessageSquare className="w-3.5 h-3.5 text-emerald-400" />
+                                  {myReview ? 'Edit your review' : 'Write a review'}
+                                </button>
+                              </div>
+                              )}
+
+                              {reviews.length === 0 ? (
+                                <p className="text-xs text-slate-500">
+                                  No reviews yet. Be the first to share what you
+                                  thought.
+                                </p>
+                              ) : (
+                                <ul className="space-y-2">
+                                  {reviews.map((rev: any) => (
+                                    <li
+                                      key={rev.id}
+                                      className="bg-slate-950 border border-slate-800 rounded-xl p-3 space-y-1.5 text-xs"
+                                    >
+                                      <div className="flex items-center justify-between gap-2">
+                                        <span className="font-bold text-white">
+                                          @{rev.username}
+                                          {rev.is_mine && (
+                                            <span className="ml-1.5 text-[10px] text-amber-300">
+                                              (you)
+                                            </span>
+                                          )}
+                                        </span>
+                                        <span className="flex items-center gap-1 text-amber-300 font-bold">
+                                          <Star className="w-3 h-3 fill-current" />{' '}
+                                          {rev.rating}/5
+                                        </span>
+                                      </div>
+                                      {(rev.meat_confirmed != null ||
+                                        rev.prayer_space) && (
+                                        <div className="flex flex-wrap gap-1.5">
+                                          {rev.meat_confirmed === true && (
+                                            <span className="text-[10px] bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded">
+                                              Staff said the meat is halal
+                                            </span>
+                                          )}
+                                          {rev.meat_confirmed === false && (
+                                            <span className="text-[10px] bg-amber-400/10 text-amber-300 border border-amber-400/30 px-2 py-0.5 rounded">
+                                              Meat not confirmed halal
+                                            </span>
+                                          )}
+                                          {rev.prayer_space && (
+                                            <span className="text-[10px] bg-sky-500/10 text-sky-300 border border-sky-500/30 px-2 py-0.5 rounded">
+                                              Prayer space
+                                            </span>
+                                          )}
+                                        </div>
+                                      )}
+                                      {rev.comment && (
+                                        <p className="text-slate-300 whitespace-pre-wrap break-words">
+                                          {rev.comment}
+                                        </p>
+                                      )}
+                                      <div className="flex items-center justify-between text-[10px] text-slate-500">
+                                        <span>
+                                          {new Date(
+                                            rev.created_at
+                                          ).toLocaleDateString('en-GB', {
+                                            month: 'short',
+                                            year: 'numeric',
+                                          })}
+                                        </span>
+                                        <div className="flex items-center gap-3">
+                                          {user && !rev.is_mine ? (
+                                            <button
+                                              onClick={() => handleToggleLike(rev)}
+                                              aria-label="Mark this review as helpful"
+                                              className={`flex items-center gap-1 transition ${
+                                                rev.liked_by_me
+                                                  ? 'text-emerald-400'
+                                                  : 'hover:text-white'
+                                              }`}
+                                            >
+                                              <ThumbsUp
+                                                className={`w-3 h-3 ${
+                                                  rev.liked_by_me
+                                                    ? 'fill-current'
+                                                    : ''
+                                                }`}
+                                              />
+                                              {Number(rev.like_count || 0)}
+                                            </button>
+                                          ) : (
+                                            <span
+                                              title={
+                                                user
+                                                  ? 'Your own review'
+                                                  : 'Sign in to mark reviews as helpful'
+                                              }
+                                              className="flex items-center gap-1"
+                                            >
+                                              <ThumbsUp className="w-3 h-3" />
+                                              {Number(rev.like_count || 0)}
+                                            </span>
+                                          )}
+                                          {rev.is_mine ? (
+                                            <button
+                                              onClick={() =>
+                                                handleDeleteReview(rest.id)
+                                              }
+                                              className="hover:text-rose-400"
+                                            >
+                                              Delete
+                                            </button>
+                                          ) : user ? (
+                                            <button
+                                              onClick={() =>
+                                                handleReportReview(rev.id)
+                                              }
+                                              className="flex items-center gap-1 hover:text-white"
+                                            >
+                                              <Flag className="w-3 h-3" /> Report
+                                            </button>
+                                          ) : null}
+                                        </div>
+                                      </div>
+                                    </li>
+                                  ))}
+                                </ul>
+                              )}
+                            </div>
                           </div>
                         ) : (
                           <div className="mt-3 flex items-center justify-between">
@@ -1682,6 +2064,9 @@ export default function UKHalalAppMapbox() {
                   @{username || 'scout'}
                 </h4>
                 <p className="text-xs text-slate-400">{user.email}</p>
+                <p className="text-xs text-slate-400">
+                  {visited.length} place{visited.length === 1 ? '' : 's'} visited
+                </p>
                 <div className="pt-1">
                   <span
                     className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
@@ -2013,6 +2398,100 @@ export default function UKHalalAppMapbox() {
         </div>
       )}
 
+      {/* REVIEW */}
+      {showReviewModal && activeRestaurant && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl overflow-y-auto max-h-[90vh]">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="font-bold text-base text-white">
+                Review {activeRestaurant.name}
+              </h3>
+              <button
+                onClick={() => setShowReviewModal(false)}
+                aria-label="Close"
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="flex items-center gap-1">
+              {[1, 2, 3, 4, 5].map((n) => (
+                <button
+                  key={n}
+                  type="button"
+                  onClick={() => setReviewRating(n)}
+                  aria-label={`${n} star${n > 1 ? 's' : ''}`}
+                >
+                  <Star
+                    className={`w-8 h-8 ${
+                      n <= reviewRating
+                        ? 'text-amber-400 fill-amber-400'
+                        : 'text-slate-600'
+                    }`}
+                  />
+                </button>
+              ))}
+            </div>
+
+            <div>
+              <label className="text-xs text-slate-400 font-medium">
+                What did you think? (optional)
+              </label>
+              <textarea
+                value={reviewComment}
+                onChange={(e) => setReviewComment(e.target.value)}
+                maxLength={1000}
+                rows={4}
+                placeholder="What did you eat? Anything others should know?"
+                className="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
+              />
+              <p className="text-[10px] text-slate-500 text-right">
+                {reviewComment.length}/1000
+              </p>
+            </div>
+
+            <TriChoice
+              label="Did staff confirm the meat is halal?"
+              value={reviewMeat}
+              onChange={setReviewMeat}
+            />
+            <TriChoice
+              label="Is there a prayer space?"
+              value={reviewPrayer}
+              onChange={setReviewPrayer}
+            />
+
+            {reviewError && (
+              <p className="text-xs text-rose-400 font-medium">{reviewError}</p>
+            )}
+
+            <p className="text-[10px] text-slate-500 leading-relaxed">
+              Reviews are public and show your username. Please be honest and
+              respectful. Your answers are your own experience and don&apos;t
+              change the restaurant&apos;s certification. A review with a comment
+              of 20+ characters earns 10 points.
+            </p>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
+              <button
+                onClick={() => setShowReviewModal(false)}
+                className="px-4 py-2 rounded-lg bg-slate-800 text-slate-300 text-xs font-semibold hover:bg-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSubmitReview}
+                disabled={submittingReview}
+                className="px-4 py-2 rounded-lg bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400 shadow disabled:opacity-50"
+              >
+                {submittingReview ? 'Saving...' : 'Post review'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* CERTIFICATE */}
       {showCertModal && activeRestaurant && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
@@ -2039,7 +2518,7 @@ export default function UKHalalAppMapbox() {
               <div>
                 <p className="text-slate-400 pt-1">Certifying Body:</p>
                 <p className="font-semibold text-emerald-400">
-                  {activeRestaurant.certificateIssuer}
+                  {activeRestaurant.certificateIssuer || 'Not specified'}
                 </p>
               </div>
               {(() => {
