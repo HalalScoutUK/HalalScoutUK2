@@ -62,6 +62,7 @@ const RESTAURANT_COLUMNS = [
   'certificate_issuer',
   'certificate_number',
   'certificate_link',
+  'certification_valid_until',
   'media',
   'reviews',
 ].join(',');
@@ -164,6 +165,106 @@ function getCategoryBadge(cat: string) {
     default:
       return { label: cat, color: 'bg-gray-600 text-white' };
   }
+}
+
+// How long after expiry a lapsed shop stays publicly visible. This must match
+// the 12-month grace period in the database function is_publicly_listed().
+const MONTHS_VISIBLE_AFTER_EXPIRY = 12;
+
+function parseDateOnly(s: string) {
+  const [y, m, d] = s.split('-').map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function formatDate(d: Date) {
+  return d.toLocaleDateString('en-GB', {
+    day: 'numeric',
+    month: 'short',
+    year: 'numeric',
+  });
+}
+
+// Whole months and years only: "less than a month", "5 months", "1 year 2 months"
+function timeSince(from: Date, to: Date) {
+  let months =
+    (to.getFullYear() - from.getFullYear()) * 12 +
+    (to.getMonth() - from.getMonth());
+  if (to.getDate() < from.getDate()) months -= 1;
+  if (months >= 12) {
+    const y = Math.floor(months / 12);
+    const m = months % 12;
+    return `${y} year${y > 1 ? 's' : ''}${
+      m ? ` ${m} month${m > 1 ? 's' : ''}` : ''
+    }`;
+  }
+  if (months >= 1) return `${months} month${months > 1 ? 's' : ''}`;
+  return 'less than a month';
+}
+
+function certificationStatus(r: any): {
+  state: 'ok' | 'lapsed' | 'options' | 'unknown';
+  label: string;
+  detail: string; // shown to the public: never contains certificate dates
+  ownerDetail: string; // shown only in the owner dashboard
+  hiddenFromPublic: boolean;
+} {
+  const cat = r.halalCategory;
+  if (cat === 'HALAL_OPTIONS') {
+    return {
+      state: 'options',
+      label: 'Halal Options',
+      detail: 'Stated by the owner. Not independently verified.',
+      ownerDetail: 'Stated by the owner. Not independently verified.',
+      hiddenFromPublic: false,
+    };
+  }
+  if (cat !== 'HMC_CERTIFIED' && cat !== 'HALAL_CERTIFIED') {
+    return {
+      state: 'unknown',
+      label: cat || 'Not categorised',
+      detail: '',
+      ownerDetail: '',
+      hiddenFromPublic: true,
+    };
+  }
+
+  const name = cat === 'HMC_CERTIFIED' ? 'HMC' : 'Halal';
+  const until = r.certification_valid_until
+    ? parseDateOnly(r.certification_valid_until)
+    : null;
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  if (until && until >= today) {
+    return {
+      state: 'ok',
+      label: `${name} Certified`,
+      detail: '',
+      ownerDetail: `Valid until ${formatDate(until)}`,
+      hiddenFromPublic: false,
+    };
+  }
+  if (!until) {
+    return {
+      state: 'lapsed',
+      label: `${name} Certification Not Renewed`,
+      detail: 'No valid certificate on record',
+      ownerDetail: 'No valid certificate on record',
+      hiddenFromPublic: true,
+    };
+  }
+  const cutoff = new Date(today);
+  cutoff.setMonth(cutoff.getMonth() - MONTHS_VISIBLE_AFTER_EXPIRY);
+  return {
+    state: 'lapsed',
+    label: `${name} Certification Not Renewed`,
+    detail: `Certification expired ${timeSince(until, today)} ago`,
+    ownerDetail: `Expired on ${formatDate(until)} (${timeSince(
+      until,
+      today
+    )} ago)`,
+    hiddenFromPublic: until < cutoff,
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -962,6 +1063,33 @@ export default function UKHalalAppMapbox() {
                         <p className="text-sm font-bold text-emerald-400 truncate pt-1">
                           {ownedRestaurant.certificateIssuer}
                         </p>
+                        {(() => {
+                          const st = certificationStatus(ownedRestaurant);
+                          return (
+                            <>
+                              <p
+                                className={`text-xs font-semibold ${
+                                  st.state === 'lapsed'
+                                    ? 'text-amber-300'
+                                    : 'text-slate-200'
+                                }`}
+                              >
+                                {st.label}
+                              </p>
+                              {st.ownerDetail && (
+                                <p className="text-[11px] text-slate-400">
+                                  {st.ownerDetail}
+                                </p>
+                              )}
+                              {st.hiddenFromPublic && (
+                                <p className="text-[11px] font-semibold text-rose-400">
+                                  Hidden from the public until you upload a
+                                  certificate.
+                                </p>
+                              )}
+                            </>
+                          );
+                        })()}
                         <a
                           href={
                             ownedRestaurant.certificateLink ||
@@ -1308,7 +1436,11 @@ export default function UKHalalAppMapbox() {
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                   {filteredRestaurants.map((rest) => {
-                    const badge = getCategoryBadge(rest.halalCategory);
+                    const status = certificationStatus(rest);
+                    const badge =
+                      status.state === 'lapsed'
+                        ? { label: status.label, color: 'bg-amber-600 text-white' }
+                        : getCategoryBadge(rest.halalCategory);
                     const isSelected = activeRestaurantId === rest.id;
                     const isFav = favorites.includes(rest.id);
                     const avgRating = getAverageRating(rest.reviews);
@@ -1391,6 +1523,21 @@ export default function UKHalalAppMapbox() {
                             )}
                           </div>
                         </div>
+
+                        {status.detail && (
+                          <p
+                            className={`mt-2 text-[11px] font-medium flex items-center gap-1 ${
+                              status.state === 'lapsed'
+                                ? 'text-amber-300'
+                                : 'text-slate-400'
+                            }`}
+                          >
+                            {status.state === 'lapsed' && (
+                              <AlertTriangle className="w-3 h-3" />
+                            )}
+                            {status.detail}
+                          </p>
+                        )}
 
                         {isSelected ? (
                           <div
@@ -1895,6 +2042,24 @@ export default function UKHalalAppMapbox() {
                   {activeRestaurant.certificateIssuer}
                 </p>
               </div>
+              {(() => {
+                const st = certificationStatus(activeRestaurant);
+                return (
+                  <div>
+                    <p className="text-slate-400 pt-1">Status:</p>
+                    <p
+                      className={`font-semibold ${
+                        st.state === 'lapsed'
+                          ? 'text-amber-300'
+                          : 'text-emerald-400'
+                      }`}
+                    >
+                      {st.label}
+                    </p>
+                    {st.detail && <p className="text-slate-400">{st.detail}</p>}
+                  </div>
+                );
+              })()}
               {activeRestaurant.certificateNumber && (
                 <div>
                   <p className="text-slate-400 pt-1">Certificate Reference:</p>
