@@ -40,12 +40,22 @@ import {
 
 type MediaKey = 'SHOP_FRONT' | 'INTERIOR' | 'FOOD' | 'MENU';
 
+// The order here is used everywhere: the photo tabs on each listing, the
+// owner dashboard preview and the owner edit form. Change it in one place.
 const MEDIA_TABS: { key: MediaKey; label: string }[] = [
-  { key: 'FOOD', label: 'Food' },
-  { key: 'SHOP_FRONT', label: 'Shop front' },
+  { key: 'SHOP_FRONT', label: 'Shop Front' },
   { key: 'INTERIOR', label: 'Interior' },
   { key: 'MENU', label: 'Menu' },
+  { key: 'FOOD', label: 'Food' },
 ];
+
+// Which owner-form field holds the image link for each photo type
+const MEDIA_FORM_KEY: Record<MediaKey, 'shopFront' | 'interior' | 'menu' | 'food'> = {
+  SHOP_FRONT: 'shopFront',
+  INTERIOR: 'interior',
+  MENU: 'menu',
+  FOOD: 'food',
+};
 
 const LONDON = { latitude: 51.5074, longitude: -0.1278 };
 
@@ -476,7 +486,7 @@ export default function UKHalalAppMapbox() {
   const [activeRestaurantId, setActiveRestaurantId] = useState<number | null>(
     null
   );
-  const [mediaTab, setMediaTab] = useState<MediaKey>('FOOD');
+  const [mediaTab, setMediaTab] = useState<MediaKey>(MEDIA_TABS[0].key);
 
   // Auth, favourites, profile & ownership
   const [user, setUser] = useState<any>(null);
@@ -490,6 +500,16 @@ export default function UKHalalAppMapbox() {
   const [reviewRating, setReviewRating] = useState(0);
   const [reviewFiles, setReviewFiles] = useState<File[]>([]);
   const [reviewProgress, setReviewProgress] = useState('');
+  const [reviewRestaurant, setReviewRestaurant] = useState<{
+    id: number;
+    name: string;
+  } | null>(null);
+  const [editingReview, setEditingReview] = useState<any | null>(null);
+  const [editingPhotos, setEditingPhotos] = useState<
+    { id: number; path: string }[]
+  >([]);
+  const [showMyReviews, setShowMyReviews] = useState(false);
+  const [myReviews, setMyReviews] = useState<any[]>([]);
   const [reviewComment, setReviewComment] = useState('');
   const [reviewMeat, setReviewMeat] = useState<boolean | null>(null);
   const [reviewPrayer, setReviewPrayer] = useState<boolean | null>(null);
@@ -789,26 +809,76 @@ export default function UKHalalAppMapbox() {
     );
   };
 
-  const openReviewModal = () => {
-    if (!user) {
-      requireSignIn();
-      return;
-    }
-    const mine = reviews.find((r) => r.is_mine);
-    setReviewRating(mine ? Number(mine.rating) : 0);
-    setReviewComment(mine?.comment ?? '');
-    setReviewMeat(mine?.my_meat_confirmed ?? null);
-    setReviewPrayer(mine?.my_prayer_space ?? null);
-    setReviewAlcohol(mine?.my_alcohol_served ?? null);
+  async function loadMyReviews() {
+    const { data, error } = await supabase.rpc('get_my_reviews');
+    setMyReviews(error ? [] : ((data as any[]) ?? []));
+  }
+
+  // Opens the review form for a restaurant, new or existing
+  const startReview = (
+    target: { id: number; name: string },
+    existing: any | null
+  ) => {
+    setReviewRestaurant(target);
+    setEditingReview(existing);
+    setEditingPhotos(existing?.photos ?? []);
+    setReviewRating(existing ? Number(existing.rating) : 0);
+    setReviewComment(existing?.comment ?? '');
+    setReviewMeat(existing?.meat ?? null);
+    setReviewPrayer(existing?.prayer ?? null);
+    setReviewAlcohol(existing?.alcohol ?? null);
     setReviewFiles([]);
     setReviewProgress('');
     setReviewError('');
     setShowReviewModal(true);
   };
 
+  // From a restaurant card
+  const openReviewModal = () => {
+    if (!user) {
+      requireSignIn();
+      return;
+    }
+    if (!activeRestaurant) return;
+    const mine = reviews.find((r) => r.is_mine);
+    startReview(
+      { id: activeRestaurant.id, name: activeRestaurant.name },
+      mine
+        ? {
+            id: mine.id,
+            rating: mine.rating,
+            comment: mine.comment,
+            like_count: Number(mine.like_count || 0),
+            photos: mine.photos ?? [],
+            meat: mine.my_meat_confirmed,
+            prayer: mine.my_prayer_space,
+            alcohol: mine.my_alcohol_served,
+          }
+        : null
+    );
+  };
+
+  // From the "My reviews" list
+  const editMyReview = (rv: any) => {
+    setShowMyReviews(false);
+    startReview(
+      { id: rv.restaurant_id, name: rv.restaurant_name },
+      {
+        id: rv.id,
+        rating: rv.rating,
+        comment: rv.comment,
+        like_count: Number(rv.like_count || 0),
+        photos: rv.photos ?? [],
+        meat: rv.meat_confirmed,
+        prayer: rv.prayer_space,
+        alcohol: rv.alcohol_served,
+      }
+    );
+  };
+
   const handlePickPhotos = (e: React.ChangeEvent<HTMLInputElement>) => {
     const room =
-      MAX_REVIEW_PHOTOS - (myReview?.photos?.length ?? 0) - reviewFiles.length;
+      MAX_REVIEW_PHOTOS - editingPhotos.length - reviewFiles.length;
     const picked = Array.from(e.target.files ?? []).filter(
       (f) => ALLOWED_PHOTO_TYPES.includes(f.type) && f.size <= 15 * 1024 * 1024
     );
@@ -820,7 +890,7 @@ export default function UKHalalAppMapbox() {
   };
 
   const handleSubmitReview = async () => {
-    if (!activeRestaurant || !user) return;
+    if (!reviewRestaurant || !user) return;
     if (reviewRating < 0.5) {
       setReviewError('Please choose a star rating.');
       return;
@@ -832,13 +902,36 @@ export default function UKHalalAppMapbox() {
       );
       return;
     }
+
+    // Editing resets thumbs up, so make sure the person knows first
+    const likes = Number(editingReview?.like_count || 0);
+    if (editingReview && likes > 0) {
+      const changed =
+        Number(editingReview.rating) !== reviewRating ||
+        (editingReview.comment ?? '') !== reviewComment.trim() ||
+        (editingReview.meat ?? null) !== reviewMeat ||
+        (editingReview.prayer ?? null) !== reviewPrayer ||
+        (editingReview.alcohol ?? null) !== reviewAlcohol ||
+        reviewFiles.length > 0;
+      if (
+        changed &&
+        !window.confirm(
+          `Saving changes resets your ${likes} thumbs up and removes the ${likes} point${
+            likes > 1 ? 's' : ''
+          } you earned from them. Continue?`
+        )
+      ) {
+        return;
+      }
+    }
+
     const pointsBefore = myPoints;
     setSubmittingReview(true);
     setReviewError('');
     setReviewProgress('');
 
     const { error } = await supabase.rpc('submit_review', {
-      p_restaurant_id: activeRestaurant.id,
+      p_restaurant_id: reviewRestaurant.id,
       p_rating: reviewRating,
       p_meat_confirmed: reviewMeat,
       p_prayer_space: reviewPrayer,
@@ -877,13 +970,13 @@ export default function UKHalalAppMapbox() {
       setReviewProgress(`Uploading photo ${i + 1} of ${reviewFiles.length}...`);
       try {
         const blob = await resizeImage(reviewFiles[i]);
-        const path = `${user.id}/${activeRestaurant.id}/${crypto.randomUUID()}.jpg`;
+        const path = `${user.id}/${reviewRestaurant.id}/${crypto.randomUUID()}.jpg`;
         const { error: upErr } = await supabase.storage
           .from('review-photos')
           .upload(path, blob, { contentType: 'image/jpeg', upsert: false });
         if (upErr) throw upErr;
         const { error: addErr } = await supabase.rpc('add_review_photo', {
-          p_restaurant_id: activeRestaurant.id,
+          p_restaurant_id: reviewRestaurant.id,
           p_file_path: path,
         });
         if (addErr) {
@@ -899,20 +992,33 @@ export default function UKHalalAppMapbox() {
     setReviewProgress('');
     setShowReviewModal(false);
     const pointsAfter = await refreshPoints(user.id);
-    const gained =
-      pointsAfter != null && pointsAfter > pointsBefore
-        ? ` You earned ${pointsAfter - pointsBefore} points.`
+    const diff = pointsAfter != null ? pointsAfter - pointsBefore : 0;
+    const pointsNote =
+      diff > 0
+        ? ` You earned ${diff} points.`
+        : diff < 0
+        ? ` Your thumbs up were reset (${diff} points).`
         : '';
     setNotice(
       failed > 0
-        ? `Saved, but ${failed} photo${failed > 1 ? 's' : ''} could not be uploaded.${gained}`
-        : `Thanks! Your review is live.${gained}`
+        ? `Saved, but ${failed} photo${failed > 1 ? 's' : ''} could not be uploaded.${pointsNote}`
+        : `${editingReview ? 'Review updated.' : 'Thanks! Your review is live.'}${pointsNote}`
     );
     setReviewsVersion((v) => v + 1);
     refreshRatings();
+    loadMyReviews();
   };
 
   const handleRemovePhoto = async (photoId: number) => {
+    const likes = Number(editingReview?.like_count || 0);
+    if (
+      likes > 0 &&
+      !window.confirm(
+        `Removing a photo resets your ${likes} thumbs up and removes the points you earned from them. Continue?`
+      )
+    ) {
+      return;
+    }
     const { data: path, error } = await supabase.rpc('delete_review_photo', {
       p_photo_id: photoId,
     });
@@ -923,23 +1029,36 @@ export default function UKHalalAppMapbox() {
     if (typeof path === 'string') {
       await supabase.storage.from('review-photos').remove([path]);
     }
+    setEditingPhotos((prev) => prev.filter((p) => p.id !== photoId));
+    setEditingReview((prev: any) => (prev ? { ...prev, like_count: 0 } : prev));
+    if (user) refreshPoints(user.id);
     setReviewsVersion((v) => v + 1);
+    loadMyReviews();
   };
 
   const handleDeleteReview = async (restaurantId: number) => {
-    if (!window.confirm('Delete your rating and photos?')) return;
+    if (
+      !window.confirm(
+        'Delete this review? You will also lose the points it earned, including any from thumbs up.'
+      )
+    ) {
+      return;
+    }
     const { data, error } = await supabase.rpc('delete_my_review', {
       p_restaurant_id: restaurantId,
     });
     if (error) {
-      setNotice('Could not delete your rating.');
+      setNotice('Could not delete your review.');
       return;
     }
     if (Array.isArray(data) && data.length > 0) {
       await supabase.storage.from('review-photos').remove(data as string[]);
     }
+    if (user) refreshPoints(user.id);
     setReviewsVersion((v) => v + 1);
     refreshRatings();
+    loadMyReviews();
+    setNotice('Review deleted.');
   };
 
   const openReportModal = () => {
@@ -1108,7 +1227,7 @@ export default function UKHalalAppMapbox() {
 
   // Photos are stored privately, so each one needs a short-lived link
   useEffect(() => {
-    const paths = reviews.flatMap((r) =>
+    const paths = [...reviews, ...myReviews].flatMap((r) =>
       Array.isArray(r.photos) ? r.photos.map((ph: any) => ph.path as string) : []
     );
     const missing = paths.filter((pth) => !photoUrls[pth]);
@@ -1131,7 +1250,7 @@ export default function UKHalalAppMapbox() {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reviews]);
+  }, [reviews, myReviews]);
 
   // Who has access to this shop's owner portal (only owners can ask)
   useEffect(() => {
@@ -1526,7 +1645,10 @@ export default function UKHalalAppMapbox() {
               <button
                 onClick={() => {
                   setShowProfileModal(true);
-                  if (user) refreshPoints(user.id);
+                  if (user) {
+                    refreshPoints(user.id);
+                    loadMyReviews();
+                  }
                 }}
                 className="flex items-center gap-2 bg-slate-800/90 hover:bg-slate-800 px-3.5 py-1.5 rounded-full text-xs border border-slate-700 shadow-inner transition cursor-pointer"
               >
@@ -2049,7 +2171,7 @@ export default function UKHalalAppMapbox() {
                             setActiveRestaurantId(null);
                           } else {
                             setActiveRestaurantId(rest.id);
-                            setMediaTab('FOOD');
+                            setMediaTab(MEDIA_TABS[0].key);
                             setViewState((prev) => ({
                               ...prev,
                               latitude: rest.lat,
@@ -2568,6 +2690,20 @@ export default function UKHalalAppMapbox() {
               </div>
             </div>
 
+            <button
+              onClick={() => {
+                setShowProfileModal(false);
+                setShowMyReviews(true);
+                loadMyReviews();
+              }}
+              className="w-full flex items-center justify-between bg-slate-800 hover:bg-slate-700 text-white font-bold px-4 py-2.5 rounded-xl text-xs transition shadow border border-slate-700"
+            >
+              <span className="flex items-center gap-2">
+                <MessageSquare className="w-4 h-4 text-emerald-400" /> My reviews
+              </span>
+              <span className="text-slate-400 font-mono">{myReviews.length}</span>
+            </button>
+
             <div className="pt-2">
               <button
                 onClick={() => setShowProfileModal(false)}
@@ -2773,13 +2909,117 @@ export default function UKHalalAppMapbox() {
         </div>
       )}
 
+      {/* MY REVIEWS */}
+      {showMyReviews && user && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-2xl overflow-y-auto max-h-[90vh]">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="font-bold text-base text-white flex items-center gap-2">
+                <MessageSquare className="w-5 h-5 text-emerald-400" /> My reviews
+              </h3>
+              <button
+                onClick={() => setShowMyReviews(false)}
+                aria-label="Close"
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Editing a review resets its thumbs up to zero and removes the
+              points they earned you. Deleting a review removes all the points
+              it earned.
+            </p>
+
+            {myReviews.length === 0 ? (
+              <p className="text-xs text-slate-500 text-center py-6">
+                You haven&apos;t reviewed anywhere yet.
+              </p>
+            ) : (
+              <ul className="space-y-3">
+                {myReviews.map((rv: any) => (
+                  <li
+                    key={rv.id}
+                    className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-2 text-xs"
+                  >
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <p className="font-bold text-white text-sm">
+                          {rv.restaurant_name}
+                        </p>
+                        {rv.restaurant_city && (
+                          <p className="text-[11px] text-slate-500">
+                            {rv.restaurant_city}
+                          </p>
+                        )}
+                      </div>
+                      <span className="flex items-center gap-1.5 text-amber-300 font-bold">
+                        <StarDisplay value={Number(rv.rating)} />
+                        {Number(rv.rating).toFixed(1)}
+                      </span>
+                    </div>
+
+                    {rv.status === 'hidden' && (
+                      <p className="text-[11px] text-rose-400 font-medium">
+                        This review has been hidden by a moderator.
+                      </p>
+                    )}
+
+                    {rv.comment && (
+                      <p className="text-slate-300 whitespace-pre-wrap break-words">
+                        {rv.comment}
+                      </p>
+                    )}
+                    <ReviewPhotoStrip photos={rv.photos} urls={photoUrls} />
+
+                    <div className="flex items-center justify-between pt-1 text-[11px] text-slate-500">
+                      <span className="flex items-center gap-1">
+                        <ThumbsUp className="w-3 h-3" />
+                        {Number(rv.like_count || 0)} thumbs up ·{' '}
+                        {new Date(rv.created_at).toLocaleDateString('en-GB', {
+                          month: 'short',
+                          year: 'numeric',
+                        })}
+                      </span>
+                      <span className="flex items-center gap-3 text-xs font-semibold">
+                        <button
+                          onClick={() => editMyReview(rv)}
+                          className="text-emerald-400 hover:text-emerald-300"
+                        >
+                          Edit
+                        </button>
+                        <button
+                          onClick={() => handleDeleteReview(rv.restaurant_id)}
+                          className="text-rose-400 hover:text-rose-300"
+                        >
+                          Delete
+                        </button>
+                      </span>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+
+            <button
+              onClick={() => setShowMyReviews(false)}
+              className="w-full bg-slate-800 hover:bg-slate-700 text-white font-bold py-2 rounded-xl text-xs transition shadow"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* REVIEW */}
-      {showReviewModal && activeRestaurant && (
+      {showReviewModal && reviewRestaurant && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl overflow-y-auto max-h-[90vh]">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <h3 className="font-bold text-base text-white">
-                Rate {activeRestaurant.name}
+                {editingReview ? 'Edit your review of' : 'Rate'}{' '}
+                {reviewRestaurant.name}
               </h3>
               <button
                 onClick={() => setShowReviewModal(false)}
@@ -2862,9 +3102,9 @@ export default function UKHalalAppMapbox() {
                 Photos (optional, up to {MAX_REVIEW_PHOTOS})
               </label>
 
-              {(myReview?.photos?.length ?? 0) > 0 && (
+              {editingPhotos.length > 0 && (
                 <div className="flex flex-wrap gap-2">
-                  {myReview.photos.map((ph: any) =>
+                  {editingPhotos.map((ph) =>
                     photoUrls[ph.path] ? (
                       <div key={ph.id} className="relative">
                         <img
@@ -2909,7 +3149,7 @@ export default function UKHalalAppMapbox() {
                 </ul>
               )}
 
-              {(myReview?.photos?.length ?? 0) + reviewFiles.length <
+              {editingPhotos.length + reviewFiles.length <
                 MAX_REVIEW_PHOTOS && (
                 <label className="flex items-center justify-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl px-3 py-2 text-xs font-semibold cursor-pointer transition">
                   <ImageIcon className="w-3.5 h-3.5 text-emerald-400" /> Add
@@ -2930,6 +3170,13 @@ export default function UKHalalAppMapbox() {
             )}
             {reviewProgress && (
               <p className="text-xs text-slate-300">{reviewProgress}</p>
+            )}
+            {editingReview && Number(editingReview.like_count || 0) > 0 && (
+              <p className="text-[11px] text-amber-300 font-medium">
+                Heads up: your review has {Number(editingReview.like_count)} thumbs
+                up. Changing it resets them to zero and removes the points they
+                earned you.
+              </p>
             )}
 
             <p className="text-[10px] text-slate-500 leading-relaxed">
@@ -3132,10 +3379,10 @@ export default function UKHalalAppMapbox() {
 
             <div className="space-y-3 text-xs">
               {[
-                { key: 'shopFront', label: 'Shop Front Image URL:' },
-                { key: 'interior', label: 'Interior Image URL:' },
-                { key: 'food', label: 'Food Shot Image URL:' },
-                { key: 'menu', label: 'Menu Image URL:' },
+                ...MEDIA_TABS.map((m) => ({
+                  key: MEDIA_FORM_KEY[m.key] as string,
+                  label: `${m.label} Image URL:`,
+                })),
                 {
                   key: 'certificateLink',
                   label: 'Certificate Website Link:',
