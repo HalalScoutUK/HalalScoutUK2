@@ -508,7 +508,8 @@ export default function UKHalalAppMapbox() {
   const [editingPhotos, setEditingPhotos] = useState<
     { id: number; path: string }[]
   >([]);
-  const [showMyReviews, setShowMyReviews] = useState(false);
+  const [page, setPage] = useState<'HOME' | 'MY_REVIEWS'>('HOME');
+  const [reviewSort, setReviewSort] = useState<'newest' | 'oldest'>('newest');
   const [myReviews, setMyReviews] = useState<any[]>([]);
   const [reviewComment, setReviewComment] = useState('');
   const [reviewMeat, setReviewMeat] = useState<boolean | null>(null);
@@ -614,10 +615,13 @@ export default function UKHalalAppMapbox() {
       if (u) {
         fetchFavorites(u.id);
         fetchVisited();
+        loadMyReviews();
         checkUserProfile(u.id);
       } else {
         setFavorites([]);
         setVisited([]);
+        setMyReviews([]);
+        setPage('HOME');
         setUsername(null);
         setOwnedRestaurantIds([]);
         setRole('USER');
@@ -859,8 +863,19 @@ export default function UKHalalAppMapbox() {
   };
 
   // From the "My reviews" list
+  const viewPlace = (rv: any) => {
+    const r = restaurants.find((x) => x.id === rv.restaurant_id);
+    if (!r) {
+      setNotice('This place is not currently listed.');
+      return;
+    }
+    setPage('HOME');
+    setRole('USER');
+    setActiveRestaurantId(r.id);
+    moveTo(r.lat, r.lng, 15);
+  };
+
   const editMyReview = (rv: any) => {
-    setShowMyReviews(false);
     startReview(
       { id: rv.restaurant_id, name: rv.restaurant_name },
       {
@@ -1037,13 +1052,29 @@ export default function UKHalalAppMapbox() {
   };
 
   const handleDeleteReview = async (restaurantId: number) => {
-    if (
-      !window.confirm(
-        'Delete this review? You will also lose the points it earned, including any from thumbs up.'
-      )
-    ) {
-      return;
+    // Ask the database exactly how many points deleting would take off
+    let message =
+      'Delete this review? You will also lose the points it earned, including any from thumbs up. This can\'t be undone.';
+    const { data: stake } = await supabase.rpc('get_review_points_at_stake', {
+      p_restaurant_id: restaurantId,
+    });
+    const row = Array.isArray(stake) ? stake[0] : stake;
+    if (row) {
+      const reviewPts = Number(row.review_points || 0);
+      const likePts = Number(row.like_points || 0);
+      const total = Number(row.total || 0);
+      if (total > 0) {
+        const plural = total === 1 ? '' : 's';
+        message =
+          reviewPts + likePts === total
+            ? `Deleting this review removes ${total} point${plural} (${reviewPts} from the review itself and ${likePts} from thumbs up). This can't be undone. Continue?`
+            : `Deleting this review removes ${total} point${plural}. This can't be undone. Continue?`;
+      } else {
+        message =
+          "Delete this review? It hasn't earned any points. This can't be undone.";
+      }
     }
+    if (!window.confirm(message)) return;
     const { data, error } = await supabase.rpc('delete_my_review', {
       p_restaurant_id: restaurantId,
     });
@@ -1491,6 +1522,7 @@ export default function UKHalalAppMapbox() {
   };
 
   const handleOwnerTab = () => {
+    setPage('HOME');
     if (isVerifiedOwner) setRole('OWNER');
     else openClaimModal();
   };
@@ -1568,6 +1600,18 @@ export default function UKHalalAppMapbox() {
 
   /* ------------------------- Render ------------------------- */
 
+  // "My reviews" page: newest or oldest first
+  const sortedMyReviews = [...myReviews].sort((a, b) => {
+    const diff =
+      new Date(b.created_at).getTime() - new Date(a.created_at).getTime();
+    const order = diff !== 0 ? diff : Number(b.id) - Number(a.id);
+    return reviewSort === 'newest' ? order : -order;
+  });
+  const myLikesTotal = myReviews.reduce(
+    (sum, rv) => sum + Number(rv.like_count || 0),
+    0
+  );
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 pb-20 font-sans overflow-x-hidden">
       <style jsx global>{`
@@ -1616,7 +1660,10 @@ export default function UKHalalAppMapbox() {
           {user && (
             <div className="flex bg-slate-800 p-1 rounded-xl border border-slate-700 text-xs shadow-inner">
               <button
-                onClick={() => setRole('USER')}
+                onClick={() => {
+                  setRole('USER');
+                  setPage('HOME');
+                }}
                 className={`flex items-center gap-1.5 px-3 py-1 rounded-lg font-medium transition ${
                   role === 'USER'
                     ? 'bg-emerald-500 text-slate-950 font-bold shadow'
@@ -1641,6 +1688,28 @@ export default function UKHalalAppMapbox() {
 
           {/* RIGHT: Profile & Sign Out / Sign In */}
           <div className="flex items-center gap-3">
+            {user && (
+              <button
+                onClick={() => {
+                  setRole('USER');
+                  setPage('MY_REVIEWS');
+                  loadMyReviews();
+                }}
+                aria-label="My reviews"
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold border transition shadow-inner ${
+                  page === 'MY_REVIEWS'
+                    ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+                    : 'bg-slate-800/90 hover:bg-slate-800 border-slate-700 text-white'
+                }`}
+              >
+                <MessageSquare className="w-4 h-4 text-emerald-400" />
+                <span className="hidden sm:inline">My reviews</span>
+                <span className="font-mono text-slate-400">
+                  {myReviews.length}
+                </span>
+              </button>
+            )}
+
             {user && (
               <button
                 onClick={() => {
@@ -1687,7 +1756,160 @@ export default function UKHalalAppMapbox() {
 
       {/* MAIN CONTENT */}
       <main className="max-w-6xl mx-auto px-4 pt-6 space-y-6">
-        {role === 'OWNER' ? (
+        {page === 'MY_REVIEWS' && user ? (
+          /* ============================ MY REVIEWS PAGE ============================ */
+          <div className="space-y-5">
+            <div className="flex flex-wrap items-end justify-between gap-3">
+              <div className="space-y-1">
+                <button
+                  onClick={() => setPage('HOME')}
+                  className="text-xs text-emerald-400 hover:underline"
+                >
+                  &larr; Back to the map
+                </button>
+                <h1 className="text-xl font-black text-white flex items-center gap-2">
+                  <MessageSquare className="w-5 h-5 text-emerald-400" /> My
+                  reviews
+                </h1>
+                <p className="text-xs text-slate-400">
+                  {sortedMyReviews.length} review
+                  {sortedMyReviews.length === 1 ? '' : 's'} · {myLikesTotal}{' '}
+                  thumbs up received
+                </p>
+              </div>
+
+              <div className="flex bg-slate-800 p-1 rounded-xl text-xs gap-1 border border-slate-700">
+                {[
+                  { v: 'newest', l: 'Newest first' },
+                  { v: 'oldest', l: 'Oldest first' },
+                ].map((o) => (
+                  <button
+                    key={o.v}
+                    onClick={() => setReviewSort(o.v as 'newest' | 'oldest')}
+                    className={`px-3 py-1 rounded-lg font-semibold transition ${
+                      reviewSort === o.v
+                        ? 'bg-emerald-500 text-slate-950 shadow'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {o.l}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <p className="text-[11px] text-slate-400 leading-relaxed">
+              Editing a review resets its thumbs up to zero and removes the
+              points they earned you. Deleting a review removes all the points
+              it earned.
+            </p>
+
+            {sortedMyReviews.length === 0 ? (
+              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 text-center space-y-3">
+                <p className="text-sm text-slate-400">
+                  You haven&apos;t reviewed anywhere yet.
+                </p>
+                <button
+                  onClick={() => setPage('HOME')}
+                  className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold px-4 py-2 rounded-xl text-xs transition shadow"
+                >
+                  Find places to review
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {sortedMyReviews.map((rv: any, i: number) => {
+                  const monthOf = (d: string) =>
+                    new Date(d).toLocaleDateString('en-GB', {
+                      month: 'long',
+                      year: 'numeric',
+                    });
+                  const month = monthOf(rv.created_at);
+                  const showMonth =
+                    i === 0 ||
+                    month !== monthOf(sortedMyReviews[i - 1].created_at);
+                  return (
+                    <React.Fragment key={rv.id}>
+                      {showMonth && (
+                        <p className="pt-2 text-[11px] font-bold uppercase tracking-wider text-slate-500">
+                          {month}
+                        </p>
+                      )}
+                      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4 space-y-2 text-xs shadow-xl">
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <p className="font-bold text-white text-sm">
+                              {rv.restaurant_name}
+                            </p>
+                            {rv.restaurant_city && (
+                              <p className="text-[11px] text-slate-500">
+                                {rv.restaurant_city}
+                              </p>
+                            )}
+                          </div>
+                          <span className="flex items-center gap-1.5 text-amber-300 font-bold">
+                            <StarDisplay value={Number(rv.rating)} />
+                            {Number(rv.rating).toFixed(1)}
+                          </span>
+                        </div>
+
+                        {rv.status === 'hidden' && (
+                          <p className="text-[11px] text-rose-400 font-medium">
+                            This review has been hidden by a moderator.
+                          </p>
+                        )}
+
+                        {rv.comment && (
+                          <p className="text-slate-300 whitespace-pre-wrap break-words">
+                            {rv.comment}
+                          </p>
+                        )}
+                        <ReviewPhotoStrip photos={rv.photos} urls={photoUrls} />
+
+                        <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] text-slate-500">
+                          <span className="flex items-center gap-1">
+                            <ThumbsUp className="w-3 h-3" />
+                            {Number(rv.like_count || 0)} thumbs up ·{' '}
+                            {new Date(rv.created_at).toLocaleDateString(
+                              'en-GB',
+                              {
+                                day: 'numeric',
+                                month: 'short',
+                                year: 'numeric',
+                              }
+                            )}
+                          </span>
+                          <span className="flex items-center gap-3 text-xs font-semibold">
+                            <button
+                              onClick={() => viewPlace(rv)}
+                              className="text-slate-300 hover:text-white"
+                            >
+                              View place
+                            </button>
+                            <button
+                              onClick={() => editMyReview(rv)}
+                              className="text-emerald-400 hover:text-emerald-300"
+                            >
+                              Edit
+                            </button>
+                            <button
+                              onClick={() =>
+                                handleDeleteReview(rv.restaurant_id)
+                              }
+                              className="text-rose-400 hover:text-rose-300"
+                            >
+                              Delete
+                            </button>
+                          </span>
+                        </div>
+                      </div>
+                    </React.Fragment>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        ) : role === 'OWNER' ? (
           /* ============================ OWNER DASHBOARD ============================ */
           <div className="space-y-6">
             {!ownedRestaurant ? (
@@ -2693,7 +2915,8 @@ export default function UKHalalAppMapbox() {
             <button
               onClick={() => {
                 setShowProfileModal(false);
-                setShowMyReviews(true);
+                setRole('USER');
+                setPage('MY_REVIEWS');
                 loadMyReviews();
               }}
               className="w-full flex items-center justify-between bg-slate-800 hover:bg-slate-700 text-white font-bold px-4 py-2.5 rounded-xl text-xs transition shadow border border-slate-700"
@@ -2905,109 +3128,6 @@ export default function UKHalalAppMapbox() {
                 {claiming ? 'Verifying...' : 'Verify & Unlock Portal'}
               </button>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* MY REVIEWS */}
-      {showMyReviews && user && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-2xl overflow-y-auto max-h-[90vh]">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <h3 className="font-bold text-base text-white flex items-center gap-2">
-                <MessageSquare className="w-5 h-5 text-emerald-400" /> My reviews
-              </h3>
-              <button
-                onClick={() => setShowMyReviews(false)}
-                aria-label="Close"
-                className="text-slate-400 hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            <p className="text-[11px] text-slate-400 leading-relaxed">
-              Editing a review resets its thumbs up to zero and removes the
-              points they earned you. Deleting a review removes all the points
-              it earned.
-            </p>
-
-            {myReviews.length === 0 ? (
-              <p className="text-xs text-slate-500 text-center py-6">
-                You haven&apos;t reviewed anywhere yet.
-              </p>
-            ) : (
-              <ul className="space-y-3">
-                {myReviews.map((rv: any) => (
-                  <li
-                    key={rv.id}
-                    className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-2 text-xs"
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <p className="font-bold text-white text-sm">
-                          {rv.restaurant_name}
-                        </p>
-                        {rv.restaurant_city && (
-                          <p className="text-[11px] text-slate-500">
-                            {rv.restaurant_city}
-                          </p>
-                        )}
-                      </div>
-                      <span className="flex items-center gap-1.5 text-amber-300 font-bold">
-                        <StarDisplay value={Number(rv.rating)} />
-                        {Number(rv.rating).toFixed(1)}
-                      </span>
-                    </div>
-
-                    {rv.status === 'hidden' && (
-                      <p className="text-[11px] text-rose-400 font-medium">
-                        This review has been hidden by a moderator.
-                      </p>
-                    )}
-
-                    {rv.comment && (
-                      <p className="text-slate-300 whitespace-pre-wrap break-words">
-                        {rv.comment}
-                      </p>
-                    )}
-                    <ReviewPhotoStrip photos={rv.photos} urls={photoUrls} />
-
-                    <div className="flex items-center justify-between pt-1 text-[11px] text-slate-500">
-                      <span className="flex items-center gap-1">
-                        <ThumbsUp className="w-3 h-3" />
-                        {Number(rv.like_count || 0)} thumbs up ·{' '}
-                        {new Date(rv.created_at).toLocaleDateString('en-GB', {
-                          month: 'short',
-                          year: 'numeric',
-                        })}
-                      </span>
-                      <span className="flex items-center gap-3 text-xs font-semibold">
-                        <button
-                          onClick={() => editMyReview(rv)}
-                          className="text-emerald-400 hover:text-emerald-300"
-                        >
-                          Edit
-                        </button>
-                        <button
-                          onClick={() => handleDeleteReview(rv.restaurant_id)}
-                          className="text-rose-400 hover:text-rose-300"
-                        >
-                          Delete
-                        </button>
-                      </span>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-
-            <button
-              onClick={() => setShowMyReviews(false)}
-              className="w-full bg-slate-800 hover:bg-slate-700 text-white font-bold py-2 rounded-xl text-xs transition shadow"
-            >
-              Close
-            </button>
           </div>
         </div>
       )}
