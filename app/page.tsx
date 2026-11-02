@@ -101,7 +101,77 @@ function getUserTier(points: number) {
   };
 }
 
-// Yes / No / Not sure chooser used in the review form
+// ---- Star ratings in half-star steps ----
+
+function StarIcon({ fill, size }: { fill: number; size: string }) {
+  return (
+    <span className={`relative inline-block ${size}`}>
+      <Star className={`absolute left-0 top-0 ${size} text-slate-600`} />
+      <span
+        className="absolute left-0 top-0 h-full overflow-hidden"
+        style={{ width: `${fill}%` }}
+      >
+        <Star className={`${size} text-amber-400 fill-amber-400`} />
+      </span>
+    </span>
+  );
+}
+
+function StarDisplay({
+  value,
+  size = 'w-3.5 h-3.5',
+}: {
+  value: number;
+  size?: string;
+}) {
+  return (
+    <span className="inline-flex gap-0.5">
+      {[1, 2, 3, 4, 5].map((n) => (
+        <StarIcon
+          key={n}
+          size={size}
+          fill={value >= n ? 100 : value >= n - 0.5 ? 50 : 0}
+        />
+      ))}
+    </span>
+  );
+}
+
+// Tap the left half of a star for x.5, the right half for a whole number
+function HalfStarPicker({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center gap-1">
+      {[1, 2, 3, 4, 5].map((n) => (
+        <span key={n} className="relative inline-block w-9 h-9">
+          <StarIcon
+            size="w-9 h-9"
+            fill={value >= n ? 100 : value >= n - 0.5 ? 50 : 0}
+          />
+          <button
+            type="button"
+            aria-label={`${n - 0.5} stars`}
+            onClick={() => onChange(n - 0.5)}
+            className="absolute left-0 top-0 h-full w-1/2"
+          />
+          <button
+            type="button"
+            aria-label={`${n} star${n > 1 ? 's' : ''}`}
+            onClick={() => onChange(n)}
+            className="absolute right-0 top-0 h-full w-1/2"
+          />
+        </span>
+      ))}
+    </div>
+  );
+}
+
+// Yes / No / Not sure chooser used for the quick questions
 function TriChoice({
   label,
   value,
@@ -135,6 +205,103 @@ function TriChoice({
           </button>
         ))}
       </div>
+    </div>
+  );
+}
+
+// Tags that appear when enough reviewers agree (the rule lives in the database)
+const TAG_STYLES: Record<string, { label: string; classes: string }> = {
+  meat_yes: {
+    label: 'Halal meat confirmed',
+    classes: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40',
+  },
+  meat_no: {
+    label: 'Halal meat not confirmed',
+    classes: 'bg-rose-500/15 text-rose-300 border-rose-500/40',
+  },
+  prayer_yes: {
+    label: 'Prayer space',
+    classes: 'bg-sky-500/15 text-sky-300 border-sky-500/40',
+  },
+  prayer_no: {
+    label: 'No prayer space',
+    classes: 'bg-slate-500/20 text-slate-300 border-slate-500/40',
+  },
+  alcohol_yes: {
+    label: 'Alcohol served',
+    classes: 'bg-amber-400/20 text-amber-300 border-amber-400/40',
+  },
+  alcohol_no: {
+    label: 'No alcohol',
+    classes: 'bg-teal-500/15 text-teal-300 border-teal-500/40',
+  },
+};
+
+const REPORT_KINDS: { value: string; label: string; hint: string }[] = [
+  { value: 'closed', label: 'Closed down', hint: 'This place no longer exists.' },
+  {
+    value: 'wrong_details',
+    label: 'Wrong details',
+    hint: 'Address, phone number or website is wrong.',
+  },
+  {
+    value: 'certification_concern',
+    label: 'Certification concern',
+    hint: 'The halal certification looks wrong or out of date.',
+  },
+];
+
+const MAX_REVIEW_PHOTOS = 4;
+const ALLOWED_PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+
+// Shrinks a photo and re-saves it as a JPEG. Re-saving also removes hidden
+// camera data such as GPS location, so users don't share where they live.
+async function resizeImage(
+  file: File,
+  maxSide = 1600,
+  quality = 0.82
+): Promise<Blob> {
+  const bitmap = await createImageBitmap(file);
+  const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+  const w = Math.round(bitmap.width * scale);
+  const h = Math.round(bitmap.height * scale);
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('canvas_unavailable');
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  bitmap.close?.();
+  return await new Promise<Blob>((resolve, reject) =>
+    canvas.toBlob(
+      (b) => (b ? resolve(b) : reject(new Error('encode_failed'))),
+      'image/jpeg',
+      quality
+    )
+  );
+}
+
+function ReviewPhotoStrip({
+  photos,
+  urls,
+}: {
+  photos: { id: number; path: string }[];
+  urls: Record<string, string>;
+}) {
+  const shown = (photos || []).filter((p) => urls[p.path]);
+  if (shown.length === 0) return null;
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {shown.map((p) => (
+        <a key={p.id} href={urls[p.path]} target="_blank" rel="noreferrer">
+          <img
+            src={urls[p.path]}
+            alt="Photo from a review"
+            loading="lazy"
+            className="w-16 h-16 object-cover rounded-lg border border-slate-800"
+          />
+        </a>
+      ))}
     </div>
   );
 }
@@ -317,10 +484,18 @@ export default function UKHalalAppMapbox() {
   const [reviews, setReviews] = useState<any[]>([]);
   const [reviewsVersion, setReviewsVersion] = useState(0);
   const [showReviewModal, setShowReviewModal] = useState(false);
-  const [reviewRating, setReviewRating] = useState(5);
-  const [reviewComment, setReviewComment] = useState('');
+  const [reviewRating, setReviewRating] = useState(0);
+  const [reviewFiles, setReviewFiles] = useState<File[]>([]);
+  const [reviewProgress, setReviewProgress] = useState('');
   const [reviewMeat, setReviewMeat] = useState<boolean | null>(null);
   const [reviewPrayer, setReviewPrayer] = useState<boolean | null>(null);
+  const [reviewAlcohol, setReviewAlcohol] = useState<boolean | null>(null);
+  const [showReportModal, setShowReportModal] = useState(false);
+  const [reportKind, setReportKind] = useState('');
+  const [reportNote, setReportNote] = useState('');
+  const [reportError, setReportError] = useState('');
+  const [sendingReport, setSendingReport] = useState(false);
+  const [photoUrls, setPhotoUrls] = useState<Record<string, string>>({});
   const [reviewError, setReviewError] = useState('');
   const [submittingReview, setSubmittingReview] = useState(false);
   const [ownedRestaurantIds, setOwnedRestaurantIds] = useState<number[]>([]);
@@ -552,13 +727,23 @@ export default function UKHalalAppMapbox() {
     return map;
   }
 
+  async function fetchTags() {
+    const { data } = await supabase.rpc('get_restaurant_tags');
+    const map: Record<number, string[]> = {};
+    ((data as any[]) ?? []).forEach((t) => {
+      (map[t.restaurant_id] = map[t.restaurant_id] || []).push(t.tag);
+    });
+    return map;
+  }
+
   async function refreshRatings() {
-    const stats = await fetchRatingStats();
+    const [stats, tags] = await Promise.all([fetchRatingStats(), fetchTags()]);
     setRestaurants((prev) =>
       prev.map((r) => ({
         ...r,
         avgRating: stats[r.id]?.avg ?? null,
         reviewCount: stats[r.id]?.count ?? 0,
+        tags: tags[r.id] ?? [],
       }))
     );
   }
@@ -602,28 +787,49 @@ export default function UKHalalAppMapbox() {
       return;
     }
     const mine = reviews.find((r) => r.is_mine);
-    setReviewRating(mine?.rating ?? 5);
-    setReviewComment(mine?.comment ?? '');
-    setReviewMeat(mine?.meat_confirmed ?? null);
-    setReviewPrayer(mine?.prayer_space ?? null);
+    setReviewRating(mine ? Number(mine.rating) : 0);
+    setReviewMeat(mine?.my_meat_confirmed ?? null);
+    setReviewPrayer(mine?.my_prayer_space ?? null);
+    setReviewAlcohol(mine?.my_alcohol_served ?? null);
+    setReviewFiles([]);
+    setReviewProgress('');
     setReviewError('');
     setShowReviewModal(true);
   };
 
+  const handlePickPhotos = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const room =
+      MAX_REVIEW_PHOTOS - (myReview?.photos?.length ?? 0) - reviewFiles.length;
+    const picked = Array.from(e.target.files ?? []).filter(
+      (f) => ALLOWED_PHOTO_TYPES.includes(f.type) && f.size <= 15 * 1024 * 1024
+    );
+    if (picked.length < (e.target.files?.length ?? 0)) {
+      setReviewError('Only JPEG, PNG or WebP photos under 15 MB are accepted.');
+    }
+    setReviewFiles((prev) => [...prev, ...picked.slice(0, Math.max(0, room))]);
+    e.target.value = '';
+  };
+
   const handleSubmitReview = async () => {
     if (!activeRestaurant || !user) return;
+    if (reviewRating < 0.5) {
+      setReviewError('Please choose a star rating.');
+      return;
+    }
     setSubmittingReview(true);
     setReviewError('');
+    setReviewProgress('');
+
     const { error } = await supabase.rpc('submit_review', {
       p_restaurant_id: activeRestaurant.id,
       p_rating: reviewRating,
-      p_comment: reviewComment.trim() || null,
       p_meat_confirmed: reviewMeat,
       p_prayer_space: reviewPrayer,
+      p_alcohol_served: reviewAlcohol,
     });
-    setSubmittingReview(false);
 
     if (error) {
+      setSubmittingReview(false);
       const m = error.message || '';
       setReviewError(
         m.includes('owner_cannot_review')
@@ -634,29 +840,116 @@ export default function UKHalalAppMapbox() {
           ? 'Please choose a username first.'
           : m.includes('restaurant_not_available')
           ? 'This restaurant is not available for reviews.'
-          : 'Could not save your review. Please try again.'
+          : 'Could not save your rating. Please try again.'
       );
       return;
     }
 
+    // Photos: shrink, upload privately, then attach to the review
+    let failed = 0;
+    for (let i = 0; i < reviewFiles.length; i++) {
+      setReviewProgress(`Uploading photo ${i + 1} of ${reviewFiles.length}...`);
+      try {
+        const blob = await resizeImage(reviewFiles[i]);
+        const path = `${user.id}/${activeRestaurant.id}/${crypto.randomUUID()}.jpg`;
+        const { error: upErr } = await supabase.storage
+          .from('review-photos')
+          .upload(path, blob, { contentType: 'image/jpeg', upsert: false });
+        if (upErr) throw upErr;
+        const { error: addErr } = await supabase.rpc('add_review_photo', {
+          p_restaurant_id: activeRestaurant.id,
+          p_file_path: path,
+        });
+        if (addErr) {
+          await supabase.storage.from('review-photos').remove([path]);
+          throw addErr;
+        }
+      } catch {
+        failed += 1;
+      }
+    }
+
+    setSubmittingReview(false);
+    setReviewProgress('');
     setShowReviewModal(false);
-    setNotice('Thanks! Your review is live.');
+    setNotice(
+      failed > 0
+        ? `Rating saved, but ${failed} photo${failed > 1 ? 's' : ''} could not be uploaded.`
+        : 'Thanks! Your rating is live.'
+    );
     setReviewsVersion((v) => v + 1);
     refreshRatings();
     refreshPoints(user.id);
   };
 
+  const handleRemovePhoto = async (photoId: number) => {
+    const { data: path, error } = await supabase.rpc('delete_review_photo', {
+      p_photo_id: photoId,
+    });
+    if (error) {
+      setNotice('Could not remove that photo.');
+      return;
+    }
+    if (typeof path === 'string') {
+      await supabase.storage.from('review-photos').remove([path]);
+    }
+    setReviewsVersion((v) => v + 1);
+  };
+
   const handleDeleteReview = async (restaurantId: number) => {
-    if (!window.confirm('Delete your review?')) return;
-    const { error } = await supabase.rpc('delete_my_review', {
+    if (!window.confirm('Delete your rating and photos?')) return;
+    const { data, error } = await supabase.rpc('delete_my_review', {
       p_restaurant_id: restaurantId,
     });
     if (error) {
-      setNotice('Could not delete your review.');
+      setNotice('Could not delete your rating.');
       return;
+    }
+    if (Array.isArray(data) && data.length > 0) {
+      await supabase.storage.from('review-photos').remove(data as string[]);
     }
     setReviewsVersion((v) => v + 1);
     refreshRatings();
+  };
+
+  const openReportModal = () => {
+    if (!user) {
+      requireSignIn();
+      return;
+    }
+    setReportKind('');
+    setReportNote('');
+    setReportError('');
+    setShowReportModal(true);
+  };
+
+  const handleSendReport = async () => {
+    if (!activeRestaurant || !user) return;
+    if (!reportKind) {
+      setReportError('Please choose what the problem is.');
+      return;
+    }
+    setSendingReport(true);
+    setReportError('');
+    const { error } = await supabase.rpc('report_listing', {
+      p_restaurant_id: activeRestaurant.id,
+      p_kind: reportKind,
+      p_note: reportNote.trim() || null,
+    });
+    setSendingReport(false);
+    if (error) {
+      const m = error.message || '';
+      setReportError(
+        m.includes('rate_limited')
+          ? 'You have sent a lot of reports today. Please try again tomorrow.'
+          : m.includes('username_required')
+          ? 'Please choose a username first.'
+          : 'Could not send your report. Please try again.'
+      );
+      return;
+    }
+    setShowReportModal(false);
+    setNotice('Thanks, we will check this listing.');
   };
 
   const handleReportReview = async (reviewId: number) => {
@@ -709,13 +1002,14 @@ export default function UKHalalAppMapbox() {
 
   useEffect(() => {
     async function fetchRestaurants() {
-      const [{ data, error }, stats] = await Promise.all([
+      const [{ data, error }, stats, tags] = await Promise.all([
         supabase
           .from('restaurants')
           // Reads every column, so new columns never need an app change. Keep
           // secrets (claim codes, user IDs) out of this table: it is public.
           .select('*'),
         fetchRatingStats(),
+        fetchTags(),
       ]);
       if (error) {
         console.error('Error fetching restaurants:', error.message);
@@ -738,6 +1032,7 @@ export default function UKHalalAppMapbox() {
             media: r.media || {},
             avgRating: stats[r.id]?.avg ?? null,
             reviewCount: stats[r.id]?.count ?? 0,
+            tags: tags[r.id] ?? [],
           }));
         setRestaurants(formatted);
       }
@@ -780,6 +1075,33 @@ export default function UKHalalAppMapbox() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [reviewsTargetId, reviewsVersion]);
+
+  // Photos are stored privately, so each one needs a short-lived link
+  useEffect(() => {
+    const paths = reviews.flatMap((r) =>
+      Array.isArray(r.photos) ? r.photos.map((ph: any) => ph.path as string) : []
+    );
+    const missing = paths.filter((pth) => !photoUrls[pth]);
+    if (missing.length === 0) return;
+    let cancelled = false;
+    supabase.storage
+      .from('review-photos')
+      .createSignedUrls(missing, 3600)
+      .then(({ data }) => {
+        if (cancelled || !data) return;
+        setPhotoUrls((prev) => {
+          const next = { ...prev };
+          data.forEach((d: any) => {
+            if (d.signedUrl && d.path) next[d.path] = d.signedUrl;
+          });
+          return next;
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [reviews]);
 
   // Who has access to this shop's owner portal (only owners can ask)
   useEffect(() => {
@@ -1407,7 +1729,7 @@ export default function UKHalalAppMapbox() {
                     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4 shadow-2xl">
                       <h3 className="text-sm font-bold text-white flex items-center gap-2">
                         <MessageSquare className="w-4 h-4 text-emerald-400" />{' '}
-                        Customer Feedback & Reviews
+                        Customer Ratings & Photos
                       </h3>
                       <div className="space-y-3">
                         {reviews.length > 0 ? (
@@ -1420,19 +1742,20 @@ export default function UKHalalAppMapbox() {
                                 <span className="font-bold text-xs text-white">
                                   @{rev.username}
                                 </span>
-                                <span className="flex items-center gap-1 bg-amber-400/20 text-amber-300 text-[10px] font-bold px-2 py-0.5 rounded border border-amber-400/40">
-                                  <Star className="w-3 h-3 fill-current" />{' '}
-                                  {rev.rating} / 5
+                                <span className="flex items-center gap-1.5 text-amber-300 text-xs font-bold">
+                                  <StarDisplay value={Number(rev.rating)} />
+                                  {Number(rev.rating).toFixed(1)}
                                 </span>
                               </div>
-                              <p className="text-xs text-slate-300">
-                                {rev.comment}
-                              </p>
+                              <ReviewPhotoStrip
+                                photos={rev.photos}
+                                urls={photoUrls}
+                              />
                             </div>
                           ))
                         ) : (
                           <p className="text-xs text-slate-500 text-center py-6">
-                            No reviews for your restaurant yet.
+                            No ratings for your restaurant yet.
                           </p>
                         )}
                       </div>
@@ -1757,6 +2080,30 @@ export default function UKHalalAppMapbox() {
                               </span>
                             )}
                           </div>
+
+                          {(rest.tags ?? []).filter(
+                            (t: string) =>
+                              TAG_STYLES[t] &&
+                              !(t === 'alcohol_yes' && rest.servesAlcohol)
+                          ).length > 0 && (
+                            <div className="flex flex-wrap gap-1.5 mt-2">
+                              {(rest.tags ?? [])
+                                .filter(
+                                  (t: string) =>
+                                    TAG_STYLES[t] &&
+                                    !(t === 'alcohol_yes' && rest.servesAlcohol)
+                                )
+                                .map((t: string) => (
+                                  <span
+                                    key={t}
+                                    title="Based on what reviewers reported"
+                                    className={`inline-flex items-center text-[10px] font-bold px-2 py-0.5 rounded border ${TAG_STYLES[t].classes}`}
+                                  >
+                                    {TAG_STYLES[t].label}
+                                  </span>
+                                ))}
+                            </div>
+                          )}
                         </div>
 
                         {status.detail && (
@@ -1887,15 +2234,21 @@ export default function UKHalalAppMapbox() {
                                   className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700 transition"
                                 >
                                   <MessageSquare className="w-3.5 h-3.5 text-emerald-400" />
-                                  {myReview ? 'Edit your review' : 'Write a review'}
+                                  {myReview ? 'Edit your rating' : 'Rate & add photos'}
+                                </button>
+                                <button
+                                  onClick={openReportModal}
+                                  className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border border-slate-700 bg-slate-800 text-slate-300 hover:bg-slate-700 transition"
+                                >
+                                  <AlertTriangle className="w-3.5 h-3.5 text-amber-400" />
+                                  Report a problem
                                 </button>
                               </div>
                               )}
 
                               {reviews.length === 0 ? (
                                 <p className="text-xs text-slate-500">
-                                  No reviews yet. Be the first to share what you
-                                  thought.
+                                  No ratings yet. Be the first to rate this place.
                                 </p>
                               ) : (
                                 <ul className="space-y-2">
@@ -1913,36 +2266,15 @@ export default function UKHalalAppMapbox() {
                                             </span>
                                           )}
                                         </span>
-                                        <span className="flex items-center gap-1 text-amber-300 font-bold">
-                                          <Star className="w-3 h-3 fill-current" />{' '}
-                                          {rev.rating}/5
+                                        <span className="flex items-center gap-1.5 text-amber-300 font-bold">
+                                          <StarDisplay value={Number(rev.rating)} />
+                                          {Number(rev.rating).toFixed(1)}
                                         </span>
                                       </div>
-                                      {(rev.meat_confirmed != null ||
-                                        rev.prayer_space) && (
-                                        <div className="flex flex-wrap gap-1.5">
-                                          {rev.meat_confirmed === true && (
-                                            <span className="text-[10px] bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 px-2 py-0.5 rounded">
-                                              Staff said the meat is halal
-                                            </span>
-                                          )}
-                                          {rev.meat_confirmed === false && (
-                                            <span className="text-[10px] bg-amber-400/10 text-amber-300 border border-amber-400/30 px-2 py-0.5 rounded">
-                                              Meat not confirmed halal
-                                            </span>
-                                          )}
-                                          {rev.prayer_space && (
-                                            <span className="text-[10px] bg-sky-500/10 text-sky-300 border border-sky-500/30 px-2 py-0.5 rounded">
-                                              Prayer space
-                                            </span>
-                                          )}
-                                        </div>
-                                      )}
-                                      {rev.comment && (
-                                        <p className="text-slate-300 whitespace-pre-wrap break-words">
-                                          {rev.comment}
-                                        </p>
-                                      )}
+                                      <ReviewPhotoStrip
+                                        photos={rev.photos}
+                                        urls={photoUrls}
+                                      />
                                       <div className="flex items-center justify-between text-[10px] text-slate-500">
                                         <span>
                                           {new Date(
@@ -2404,7 +2736,7 @@ export default function UKHalalAppMapbox() {
           <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl overflow-y-auto max-h-[90vh]">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <h3 className="font-bold text-base text-white">
-                Review {activeRestaurant.name}
+                Rate {activeRestaurant.name}
               </h3>
               <button
                 onClick={() => setShowReviewModal(false)}
@@ -2415,62 +2747,117 @@ export default function UKHalalAppMapbox() {
               </button>
             </div>
 
-            <div className="flex items-center gap-1">
-              {[1, 2, 3, 4, 5].map((n) => (
-                <button
-                  key={n}
-                  type="button"
-                  onClick={() => setReviewRating(n)}
-                  aria-label={`${n} star${n > 1 ? 's' : ''}`}
-                >
-                  <Star
-                    className={`w-8 h-8 ${
-                      n <= reviewRating
-                        ? 'text-amber-400 fill-amber-400'
-                        : 'text-slate-600'
-                    }`}
-                  />
-                </button>
-              ))}
-            </div>
-
-            <div>
-              <label className="text-xs text-slate-400 font-medium">
-                What did you think? (optional)
-              </label>
-              <textarea
-                value={reviewComment}
-                onChange={(e) => setReviewComment(e.target.value)}
-                maxLength={1000}
-                rows={4}
-                placeholder="What did you eat? Anything others should know?"
-                className="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
-              />
-              <p className="text-[10px] text-slate-500 text-right">
-                {reviewComment.length}/1000
+            <div className="space-y-1">
+              <HalfStarPicker value={reviewRating} onChange={setReviewRating} />
+              <p className="text-xs text-slate-400">
+                {reviewRating >= 0.5
+                  ? `${reviewRating.toFixed(1)} out of 5`
+                  : 'Tap a star. Tap the left half for a half star.'}
               </p>
             </div>
 
-            <TriChoice
-              label="Did staff confirm the meat is halal?"
-              value={reviewMeat}
-              onChange={setReviewMeat}
-            />
-            <TriChoice
-              label="Is there a prayer space?"
-              value={reviewPrayer}
-              onChange={setReviewPrayer}
-            />
+            <div className="space-y-3 border-t border-slate-800 pt-3">
+              <p className="text-xs text-slate-400">
+                Quick questions (optional). When enough people agree, they show
+                as tags on the listing.
+              </p>
+              <TriChoice
+                label="Did staff confirm the meat is halal?"
+                value={reviewMeat}
+                onChange={setReviewMeat}
+              />
+              <TriChoice
+                label="Is there a prayer space?"
+                value={reviewPrayer}
+                onChange={setReviewPrayer}
+              />
+              <TriChoice
+                label="Is alcohol served?"
+                value={reviewAlcohol}
+                onChange={setReviewAlcohol}
+              />
+            </div>
+
+            <div className="space-y-2 border-t border-slate-800 pt-3">
+              <label className="text-xs text-slate-300 font-medium">
+                Photos (optional, up to {MAX_REVIEW_PHOTOS})
+              </label>
+
+              {(myReview?.photos?.length ?? 0) > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {myReview.photos.map((ph: any) =>
+                    photoUrls[ph.path] ? (
+                      <div key={ph.id} className="relative">
+                        <img
+                          src={photoUrls[ph.path]}
+                          alt="Your photo"
+                          className="w-16 h-16 object-cover rounded-lg border border-slate-700"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => handleRemovePhoto(ph.id)}
+                          aria-label="Remove this photo"
+                          className="absolute -top-1.5 -right-1.5 bg-slate-950 border border-slate-600 rounded-full p-0.5 text-slate-300 hover:text-rose-400"
+                        >
+                          <X className="w-3 h-3" />
+                        </button>
+                      </div>
+                    ) : null
+                  )}
+                </div>
+              )}
+
+              {reviewFiles.length > 0 && (
+                <ul className="space-y-1">
+                  {reviewFiles.map((f, i) => (
+                    <li
+                      key={`${f.name}-${i}`}
+                      className="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-[11px] text-slate-300"
+                    >
+                      <span className="truncate pr-2">{f.name}</span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setReviewFiles((prev) => prev.filter((_, j) => j !== i))
+                        }
+                        aria-label="Remove this photo"
+                        className="text-slate-400 hover:text-rose-400"
+                      >
+                        <X className="w-3 h-3" />
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+
+              {(myReview?.photos?.length ?? 0) + reviewFiles.length <
+                MAX_REVIEW_PHOTOS && (
+                <label className="flex items-center justify-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 rounded-xl px-3 py-2 text-xs font-semibold cursor-pointer transition">
+                  <ImageIcon className="w-3.5 h-3.5 text-emerald-400" /> Add
+                  photos
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp"
+                    multiple
+                    onChange={handlePickPhotos}
+                    className="hidden"
+                  />
+                </label>
+              )}
+            </div>
 
             {reviewError && (
               <p className="text-xs text-rose-400 font-medium">{reviewError}</p>
             )}
+            {reviewProgress && (
+              <p className="text-xs text-slate-300">{reviewProgress}</p>
+            )}
 
             <p className="text-[10px] text-slate-500 leading-relaxed">
-              Reviews are public and show your username. Please be honest and
-              respectful. Your answers are your own experience and don&apos;t
-              change the restaurant&apos;s certification. A review with a comment
-              of 20+ characters earns 10 points.
+              Ratings and photos are public and show your username. Only upload
+              your own photos of the food or the restaurant, and avoid showing
+              other people. Photos are resized and location data is removed
+              before upload. Photos can be reported and removed.
             </p>
 
             <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
@@ -2485,7 +2872,85 @@ export default function UKHalalAppMapbox() {
                 disabled={submittingReview}
                 className="px-4 py-2 rounded-lg bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400 shadow disabled:opacity-50"
               >
-                {submittingReview ? 'Saving...' : 'Post review'}
+                {submittingReview ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* REPORT A PROBLEM */}
+      {showReportModal && activeRestaurant && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl overflow-y-auto max-h-[90vh]">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="font-bold text-base text-white">
+                Report a problem with {activeRestaurant.name}
+              </h3>
+              <button
+                onClick={() => setShowReportModal(false)}
+                aria-label="Close"
+                className="text-slate-400 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              {REPORT_KINDS.map((k) => (
+                <button
+                  key={k.value}
+                  type="button"
+                  onClick={() => setReportKind(k.value)}
+                  className={`w-full text-left px-3 py-2.5 rounded-xl border transition ${
+                    reportKind === k.value
+                      ? 'bg-emerald-500/15 border-emerald-500'
+                      : 'bg-slate-800 border-slate-700 hover:bg-slate-700'
+                  }`}
+                >
+                  <span className="block text-xs font-bold text-white">
+                    {k.label}
+                  </span>
+                  <span className="block text-[11px] text-slate-400">
+                    {k.hint}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            <div>
+              <label className="text-xs text-slate-400 font-medium">
+                Anything we should know? (optional, only we see this)
+              </label>
+              <textarea
+                value={reportNote}
+                onChange={(e) => setReportNote(e.target.value)}
+                maxLength={200}
+                rows={3}
+                className="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
+              />
+              <p className="text-[10px] text-slate-500 text-right">
+                {reportNote.length}/200
+              </p>
+            </div>
+
+            {reportError && (
+              <p className="text-xs text-rose-400 font-medium">{reportError}</p>
+            )}
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
+              <button
+                onClick={() => setShowReportModal(false)}
+                className="px-4 py-2 rounded-lg bg-slate-800 text-slate-300 text-xs font-semibold hover:bg-slate-700"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleSendReport}
+                disabled={sendingReport}
+                className="px-4 py-2 rounded-lg bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300 shadow disabled:opacity-50"
+              >
+                {sendingReport ? 'Sending...' : 'Send report'}
               </button>
             </div>
           </div>
