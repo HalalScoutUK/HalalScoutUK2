@@ -1,6 +1,13 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+} from 'react';
+import { createPortal } from 'react-dom';
 import Map, { Marker, Popup, Source, Layer } from 'react-map-gl/mapbox';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import { createClient } from '@/lib/supabase/client';
@@ -18,6 +25,7 @@ import {
   Search,
   Crosshair,
   ChevronRight,
+  ChevronLeft,
   X,
   Star,
   Heart,
@@ -294,28 +302,466 @@ async function resizeImage(
   );
 }
 
+// ---------------------------------------------------------------------------
+// Photo viewer: a full-screen pop-up inside the app. The photo grows out of its
+// thumbnail, you can swipe or use the arrow keys between photos, tap to zoom,
+// drag down to dismiss, and it shrinks back into the thumbnail on close.
+// ---------------------------------------------------------------------------
+
+const LB_EASE = 'cubic-bezier(0.22, 1, 0.36, 1)';
+
+function rectIsOnScreen(r: DOMRect) {
+  return (
+    r.width > 0 &&
+    r.height > 0 &&
+    r.bottom > 0 &&
+    r.right > 0 &&
+    r.top < window.innerHeight &&
+    r.left < window.innerWidth
+  );
+}
+
+function PhotoLightbox({
+  images,
+  startIndex,
+  caption,
+  getThumbRect,
+  onClose,
+}: {
+  images: string[];
+  startIndex: number;
+  caption?: string;
+  getThumbRect: (i: number) => DOMRect | null;
+  onClose: () => void;
+}) {
+  const total = images.length;
+  const [index, setIndex] = useState(startIndex);
+  const [direction, setDirection] = useState<1 | -1 | 0>(0);
+  const [visible, setVisible] = useState(false);
+  const [loaded, setLoaded] = useState<Record<number, boolean>>({});
+  const [failed, setFailed] = useState<Record<number, boolean>>({});
+  const [zoomed, setZoomed] = useState(false);
+  const [origin, setOrigin] = useState({ x: 50, y: 50 });
+  const [dragY, setDragY] = useState(0);
+  const [dragging, setDragging] = useState(false);
+
+  const heroRef = useRef<HTMLDivElement>(null);
+  const imgRef = useRef<HTMLImageElement>(null);
+  const closeBtnRef = useRef<HTMLButtonElement>(null);
+  const heroDone = useRef(false);
+  const closing = useRef(false);
+  const indexRef = useRef(index);
+  indexRef.current = index;
+  const touch = useRef<{
+    x: number;
+    y: number;
+    dx: number;
+    axis: 'x' | 'y' | null;
+  }>({ x: 0, y: 0, dx: 0, axis: null });
+
+  const reduceMotion =
+    typeof window !== 'undefined' &&
+    !!window.matchMedia &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // Moves the photo between its thumbnail's position and the centre of the screen
+  const flyTo = (thumb: DOMRect, toThumb: boolean) => {
+    const hero = heroRef.current;
+    if (!hero) return false;
+    const box = hero.getBoundingClientRect();
+    if (box.width < 10 || box.height < 10) return false;
+    const s = Math.max(thumb.width / box.width, thumb.height / box.height);
+    const dx = thumb.left + thumb.width / 2 - (box.left + box.width / 2);
+    const dy = thumb.top + thumb.height / 2 - (box.top + box.height / 2);
+    const cropX = Math.max(0, (box.width * s - thumb.width) / 2 / s);
+    const cropY = Math.max(0, (box.height * s - thumb.height) / 2 / s);
+    const small = `translate(${dx}px, ${dy}px) scale(${s})`;
+    const smallClip = `inset(${cropY}px ${cropX}px round ${8 / s}px)`;
+    const big = 'translate(0px, 0px) scale(1)';
+    const bigClip = 'inset(0px 0px round 0px)';
+    const move = `transform 420ms ${LB_EASE}, clip-path 420ms ${LB_EASE}`;
+
+    if (!toThumb) {
+      hero.style.transition = 'none';
+      hero.style.transform = small;
+      hero.style.clipPath = smallClip;
+      void hero.offsetWidth; // make the browser register the starting point
+    }
+    hero.style.transition = move;
+    hero.style.transform = toThumb ? small : big;
+    hero.style.clipPath = toThumb ? smallClip : bigClip;
+    return true;
+  };
+
+  const startHero = () => {
+    if (heroDone.current) return;
+    const img = imgRef.current;
+    if (!img || !img.naturalWidth) return;
+    heroDone.current = true;
+    const thumb = getThumbRect(startIndex);
+    if (!reduceMotion && thumb && rectIsOnScreen(thumb)) flyTo(thumb, false);
+    setVisible(true);
+  };
+
+  const requestClose = (viaDrag = false) => {
+    if (closing.current) return;
+    closing.current = true;
+    const thumb = getThumbRect(indexRef.current);
+    setZoomed(false);
+    setVisible(false);
+    let flew = false;
+    if (!viaDrag && !reduceMotion && thumb && rectIsOnScreen(thumb)) {
+      flew = flyTo(thumb, true);
+    }
+    if (!flew && heroRef.current) {
+      heroRef.current.style.transition = 'opacity 240ms ease-out';
+      heroRef.current.style.opacity = '0';
+    }
+    window.setTimeout(onClose, flew ? 420 : 250);
+  };
+
+  const go = (delta: number) => {
+    if (total < 2) return;
+    setDirection(delta > 0 ? 1 : -1);
+    setZoomed(false);
+    setIndex((i) => (i + delta + total) % total);
+  };
+
+  const goTo = (i: number) => {
+    if (i === index) return;
+    setDirection(i > index ? 1 : -1);
+    setZoomed(false);
+    setIndex(i);
+  };
+
+  // The key handler is attached once, so it reads the latest functions from here
+  const latest = useRef({ go, close: () => requestClose() });
+  latest.current = { go, close: () => requestClose() };
+
+  useLayoutEffect(() => {
+    const img = imgRef.current;
+    if (img && img.complete && img.naturalWidth) {
+      setLoaded((l) => ({ ...l, [startIndex]: true }));
+      startHero();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        latest.current.close();
+      } else if (e.key === 'ArrowRight') {
+        latest.current.go(1);
+      } else if (e.key === 'ArrowLeft') {
+        latest.current.go(-1);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const previousFocus = document.activeElement as HTMLElement | null;
+    closeBtnRef.current?.focus();
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.body.style.overflow = previousOverflow;
+      previousFocus?.focus?.();
+    };
+  }, []);
+
+  // Load the neighbouring photos in advance so swiping feels instant
+  useEffect(() => {
+    if (total < 2) return;
+    [index + 1, index - 1].forEach((i) => {
+      const im = new Image();
+      im.src = images[(i + total) % total];
+    });
+  }, [index, images, total]);
+
+  const panTo = (clientX: number, clientY: number) => {
+    const box = heroRef.current?.getBoundingClientRect();
+    if (!box || box.width === 0 || box.height === 0) return;
+    const x = Math.min(100, Math.max(0, ((clientX - box.left) / box.width) * 100));
+    const y = Math.min(100, Math.max(0, ((clientY - box.top) / box.height) * 100));
+    setOrigin({ x, y });
+  };
+
+  const onImageClick = (e: React.MouseEvent<HTMLImageElement>) => {
+    e.stopPropagation();
+    if (!zoomed) panTo(e.clientX, e.clientY);
+    setZoomed((z) => !z);
+  };
+
+  const onTouchStart = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    const t = e.touches[0];
+    touch.current = { x: t.clientX, y: t.clientY, dx: 0, axis: null };
+  };
+
+  const onTouchMove = (e: React.TouchEvent) => {
+    if (e.touches.length !== 1) return;
+    const t = e.touches[0];
+    if (zoomed) {
+      panTo(t.clientX, t.clientY);
+      return;
+    }
+    const dx = t.clientX - touch.current.x;
+    const dy = t.clientY - touch.current.y;
+    touch.current.dx = dx;
+    if (!touch.current.axis && (Math.abs(dx) > 8 || Math.abs(dy) > 8)) {
+      touch.current.axis = Math.abs(dx) > Math.abs(dy) ? 'x' : 'y';
+    }
+    if (touch.current.axis === 'y') {
+      setDragging(true);
+      setDragY(dy);
+    }
+  };
+
+  const onTouchEnd = () => {
+    const { axis, dx } = touch.current;
+    touch.current.axis = null;
+    if (axis === 'x' && Math.abs(dx) > 50) {
+      go(dx < 0 ? 1 : -1);
+    } else if (axis === 'y') {
+      setDragging(false);
+      if (Math.abs(dragY) > 110) requestClose(true);
+      else setDragY(0);
+    }
+  };
+
+  const glass =
+    'w-10 h-10 rounded-full bg-slate-900/70 border border-slate-700 text-white backdrop-blur flex items-center justify-center hover:bg-slate-800 active:scale-95 transition';
+  const fade = (extra = '') => ({
+    opacity: visible ? 1 : 0,
+    transition: `opacity 300ms ease-out ${extra}`,
+  });
+
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Photo viewer"
+      className="fixed inset-0 z-[70] select-none"
+      onClick={(e) => e.stopPropagation()}
+    >
+      {/* Backdrop: fades, and gets lighter as you drag the photo down */}
+      <div
+        className="absolute inset-0 bg-slate-950/95 backdrop-blur-md"
+        style={{
+          opacity: visible ? 1 - Math.min(Math.abs(dragY) / 400, 0.6) : 0,
+          transition: dragging ? 'none' : 'opacity 300ms ease-out',
+        }}
+      />
+
+      {/* Stage: clicking empty space closes the viewer */}
+      <div
+        className="absolute inset-0 flex items-center justify-center px-4 pt-16 pb-32"
+        onClick={() => requestClose()}
+        onTouchStart={onTouchStart}
+        onTouchMove={onTouchMove}
+        onTouchEnd={onTouchEnd}
+      >
+        {!loaded[index] && !failed[index] && (
+          <div className="absolute pointer-events-none">
+            <div className="w-8 h-8 rounded-full border-2 border-slate-600 border-t-emerald-400 animate-spin" />
+          </div>
+        )}
+        {failed[index] && (
+          <p className="absolute text-xs text-slate-400">
+            Sorry, this photo couldn&apos;t be loaded.
+          </p>
+        )}
+
+        <div
+          ref={heroRef}
+          className="relative overflow-hidden rounded-xl shadow-2xl will-change-transform"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div
+            key={index}
+            className={
+              direction === 1
+                ? 'lb-slide-next'
+                : direction === -1
+                ? 'lb-slide-prev'
+                : ''
+            }
+            style={{
+              transform: dragY
+                ? `translateY(${dragY}px) scale(${
+                    1 - Math.min(Math.abs(dragY) / 1200, 0.12)
+                  })`
+                : undefined,
+              transition: dragging ? 'none' : 'transform 250ms ease-out',
+            }}
+          >
+            <img
+              ref={imgRef}
+              src={images[index]}
+              alt={`Photo ${index + 1} of ${total}`}
+              draggable={false}
+              onLoad={() => {
+                setLoaded((l) => ({ ...l, [index]: true }));
+                startHero();
+              }}
+              onError={() => setFailed((f) => ({ ...f, [index]: true }))}
+              onClick={onImageClick}
+              onMouseMove={(e) => {
+                if (zoomed) panTo(e.clientX, e.clientY);
+              }}
+              className={`block object-contain max-w-[92vw] max-h-[calc(100vh-12rem)] ${
+                zoomed ? 'cursor-zoom-out' : 'cursor-zoom-in'
+              }`}
+              style={{
+                opacity: loaded[index] ? 1 : 0,
+                transform: zoomed ? 'scale(2.2)' : 'scale(1)',
+                transformOrigin: `${origin.x}% ${origin.y}%`,
+                transition: `opacity 250ms ease-out, transform 300ms ${LB_EASE}, transform-origin 120ms ease-out`,
+              }}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Top bar */}
+      <div
+        className="absolute top-0 inset-x-0 flex items-center justify-between px-4 py-3 z-10 pointer-events-none"
+        style={fade()}
+      >
+        <span className="pointer-events-auto text-xs font-semibold text-slate-200 bg-slate-900/70 border border-slate-700 rounded-full px-3 py-1.5 backdrop-blur">
+          {index + 1} / {total}
+        </span>
+        <button
+          ref={closeBtnRef}
+          type="button"
+          onClick={() => requestClose()}
+          aria-label="Close photo viewer"
+          className={`${glass} pointer-events-auto`}
+        >
+          <X className="w-5 h-5" />
+        </button>
+      </div>
+
+      {/* Previous / next */}
+      {total > 1 && (
+        <>
+          <button
+            type="button"
+            onClick={() => go(-1)}
+            aria-label="Previous photo"
+            className={`${glass} absolute left-3 top-1/2 -translate-y-1/2 z-10`}
+            style={fade()}
+          >
+            <ChevronLeft className="w-5 h-5" />
+          </button>
+          <button
+            type="button"
+            onClick={() => go(1)}
+            aria-label="Next photo"
+            className={`${glass} absolute right-3 top-1/2 -translate-y-1/2 z-10`}
+            style={fade()}
+          >
+            <ChevronRight className="w-5 h-5" />
+          </button>
+        </>
+      )}
+
+      {/* Bottom: caption and thumbnails */}
+      <div
+        className="absolute bottom-0 inset-x-0 px-4 pb-5 pt-3 z-10 flex flex-col items-center gap-3 pointer-events-none"
+        style={fade('80ms')}
+      >
+        {caption && (
+          <p className="text-xs font-semibold text-slate-200 bg-slate-900/70 border border-slate-700 rounded-full px-3 py-1.5 backdrop-blur max-w-full truncate">
+            {caption}
+          </p>
+        )}
+        {total > 1 && (
+          <div className="pointer-events-auto flex gap-2 overflow-x-auto max-w-full p-1">
+            {images.map((src, i) => (
+              <button
+                key={src}
+                type="button"
+                onClick={() => goTo(i)}
+                aria-label={`Show photo ${i + 1}`}
+                className={`shrink-0 w-12 h-12 rounded-lg overflow-hidden border-2 transition ${
+                  i === index
+                    ? 'border-emerald-400 scale-110'
+                    : 'border-transparent opacity-60 hover:opacity-100'
+                }`}
+              >
+                <img
+                  src={src}
+                  alt=""
+                  draggable={false}
+                  className="w-full h-full object-cover"
+                />
+              </button>
+            ))}
+          </div>
+        )}
+        <p className="hidden sm:block text-[10px] text-slate-500">
+          Click the photo to zoom · arrow keys to browse · Esc to close
+        </p>
+      </div>
+    </div>,
+    document.body
+  );
+}
+
 function ReviewPhotoStrip({
   photos,
   urls,
+  caption,
 }: {
   photos: { id: number; path: string }[];
   urls: Record<string, string>;
+  caption?: string;
 }) {
+  const [openIndex, setOpenIndex] = useState<number | null>(null);
+  const thumbRefs = useRef<(HTMLButtonElement | null)[]>([]);
   const shown = (photos || []).filter((p) => urls[p.path]);
   if (shown.length === 0) return null;
+
   return (
-    <div className="flex flex-wrap gap-1.5">
-      {shown.map((p) => (
-        <a key={p.id} href={urls[p.path]} target="_blank" rel="noreferrer">
-          <img
-            src={urls[p.path]}
-            alt="Photo from a review"
-            loading="lazy"
-            className="w-16 h-16 object-cover rounded-lg border border-slate-800"
-          />
-        </a>
-      ))}
-    </div>
+    <>
+      <div className="flex flex-wrap gap-1.5">
+        {shown.map((p, i) => (
+          <button
+            key={p.id}
+            type="button"
+            ref={(el) => {
+              thumbRefs.current[i] = el;
+            }}
+            onClick={(e) => {
+              e.stopPropagation();
+              setOpenIndex(i);
+            }}
+            aria-label={`Open photo ${i + 1} of ${shown.length}`}
+            className="group relative overflow-hidden rounded-lg border border-slate-800 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+          >
+            <img
+              src={urls[p.path]}
+              alt="Photo from a review"
+              loading="lazy"
+              className="w-16 h-16 object-cover transition-transform duration-300 group-hover:scale-110"
+            />
+          </button>
+        ))}
+      </div>
+      {openIndex !== null && (
+        <PhotoLightbox
+          images={shown.map((p) => urls[p.path])}
+          startIndex={openIndex}
+          caption={caption}
+          getThumbRect={(i) =>
+            thumbRefs.current[i]?.getBoundingClientRect() ?? null
+          }
+          onClose={() => setOpenIndex(null)}
+        />
+      )}
+    </>
   );
 }
 
@@ -511,6 +957,7 @@ export default function UKHalalAppMapbox() {
   const [page, setPage] = useState<'HOME' | 'MY_REVIEWS'>('HOME');
   const [reviewSort, setReviewSort] = useState<'newest' | 'oldest'>('newest');
   const [myReviews, setMyReviews] = useState<any[]>([]);
+  const [myReviewsError, setMyReviewsError] = useState(false);
   const [reviewComment, setReviewComment] = useState('');
   const [reviewMeat, setReviewMeat] = useState<boolean | null>(null);
   const [reviewPrayer, setReviewPrayer] = useState<boolean | null>(null);
@@ -815,7 +1262,15 @@ export default function UKHalalAppMapbox() {
 
   async function loadMyReviews() {
     const { data, error } = await supabase.rpc('get_my_reviews');
-    setMyReviews(error ? [] : ((data as any[]) ?? []));
+    if (error) {
+      // Details go to the browser console (F12) instead of being hidden
+      console.error('get_my_reviews failed:', error.message);
+      setMyReviewsError(true);
+      setMyReviews([]);
+      return;
+    }
+    setMyReviewsError(false);
+    setMyReviews((data as any[]) ?? []);
   }
 
   // Opens the review form for a restaurant, new or existing
@@ -1632,6 +2087,38 @@ export default function UKHalalAppMapbox() {
         .mapboxgl-popup-anchor-right .mapboxgl-popup-tip {
           border-left-color: #0f172a !important;
         }
+        @keyframes lb-slide-next {
+          from {
+            opacity: 0;
+            transform: translateX(64px) scale(0.96);
+          }
+          to {
+            opacity: 1;
+            transform: none;
+          }
+        }
+        @keyframes lb-slide-prev {
+          from {
+            opacity: 0;
+            transform: translateX(-64px) scale(0.96);
+          }
+          to {
+            opacity: 1;
+            transform: none;
+          }
+        }
+        .lb-slide-next {
+          animation: lb-slide-next 340ms cubic-bezier(0.22, 1, 0.36, 1);
+        }
+        .lb-slide-prev {
+          animation: lb-slide-prev 340ms cubic-bezier(0.22, 1, 0.36, 1);
+        }
+        @media (prefers-reduced-motion: reduce) {
+          .lb-slide-next,
+          .lb-slide-prev {
+            animation: none;
+          }
+        }
       `}</style>
 
       {/* TOAST */}
@@ -1804,6 +2291,13 @@ export default function UKHalalAppMapbox() {
               it earned.
             </p>
 
+            {myReviewsError && (
+              <div className="bg-rose-950/40 border border-rose-500/40 text-rose-300 text-xs p-3 rounded-xl">
+                We couldn&apos;t load your reviews right now. Please try again
+                in a moment.
+              </div>
+            )}
+
             {sortedMyReviews.length === 0 ? (
               <div className="bg-slate-900 border border-slate-800 rounded-2xl p-10 text-center space-y-3">
                 <p className="text-sm text-slate-400">
@@ -1864,7 +2358,11 @@ export default function UKHalalAppMapbox() {
                             {rv.comment}
                           </p>
                         )}
-                        <ReviewPhotoStrip photos={rv.photos} urls={photoUrls} />
+                        <ReviewPhotoStrip
+                          photos={rv.photos}
+                          urls={photoUrls}
+                          caption={rv.restaurant_name}
+                        />
 
                         <div className="flex flex-wrap items-center justify-between gap-2 pt-1 text-[11px] text-slate-500">
                           <span className="flex items-center gap-1">
@@ -2132,6 +2630,7 @@ export default function UKHalalAppMapbox() {
                               <ReviewPhotoStrip
                                 photos={rev.photos}
                                 urls={photoUrls}
+                                caption={`Photo by @${rev.username}`}
                               />
                             </div>
                           ))
@@ -2661,6 +3160,7 @@ export default function UKHalalAppMapbox() {
                                       <ReviewPhotoStrip
                                         photos={rev.photos}
                                         urls={photoUrls}
+                                        caption={`Photo by @${rev.username}`}
                                       />
                                       <div className="flex items-center justify-between text-[10px] text-slate-500">
                                         <span>
