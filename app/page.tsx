@@ -251,6 +251,9 @@ const REPORT_KINDS: { value: string; label: string; hint: string }[] = [
   },
 ];
 
+// A written review needs at least this many characters (matches the database)
+const MIN_REVIEW_CHARS = 20;
+const MAX_REVIEW_CHARS = 1000;
 const MAX_REVIEW_PHOTOS = 4;
 const ALLOWED_PHOTO_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 
@@ -487,6 +490,7 @@ export default function UKHalalAppMapbox() {
   const [reviewRating, setReviewRating] = useState(0);
   const [reviewFiles, setReviewFiles] = useState<File[]>([]);
   const [reviewProgress, setReviewProgress] = useState('');
+  const [reviewComment, setReviewComment] = useState('');
   const [reviewMeat, setReviewMeat] = useState<boolean | null>(null);
   const [reviewPrayer, setReviewPrayer] = useState<boolean | null>(null);
   const [reviewAlcohol, setReviewAlcohol] = useState<boolean | null>(null);
@@ -712,7 +716,11 @@ export default function UKHalalAppMapbox() {
       .select('points')
       .eq('id', userId)
       .maybeSingle();
-    if (data?.points != null) setMyPoints(data.points);
+    if (data?.points != null) {
+      setMyPoints(data.points);
+      return data.points as number;
+    }
+    return null;
   }
 
   async function fetchRatingStats() {
@@ -788,6 +796,7 @@ export default function UKHalalAppMapbox() {
     }
     const mine = reviews.find((r) => r.is_mine);
     setReviewRating(mine ? Number(mine.rating) : 0);
+    setReviewComment(mine?.comment ?? '');
     setReviewMeat(mine?.my_meat_confirmed ?? null);
     setReviewPrayer(mine?.my_prayer_space ?? null);
     setReviewAlcohol(mine?.my_alcohol_served ?? null);
@@ -816,6 +825,14 @@ export default function UKHalalAppMapbox() {
       setReviewError('Please choose a star rating.');
       return;
     }
+    const flat = reviewComment.replace(/\s+/g, ' ').trim();
+    if (flat.length > 0 && flat.length < MIN_REVIEW_CHARS) {
+      setReviewError(
+        `A written review needs at least ${MIN_REVIEW_CHARS} characters. You can also leave it empty and just rate.`
+      );
+      return;
+    }
+    const pointsBefore = myPoints;
     setSubmittingReview(true);
     setReviewError('');
     setReviewProgress('');
@@ -826,6 +843,7 @@ export default function UKHalalAppMapbox() {
       p_meat_confirmed: reviewMeat,
       p_prayer_space: reviewPrayer,
       p_alcohol_served: reviewAlcohol,
+      p_comment: reviewComment.trim() || null,
     });
 
     if (error) {
@@ -840,7 +858,15 @@ export default function UKHalalAppMapbox() {
           ? 'Please choose a username first.'
           : m.includes('restaurant_not_available')
           ? 'This restaurant is not available for reviews.'
-          : 'Could not save your rating. Please try again.'
+          : m.includes('comment_too_short')
+          ? `A written review needs at least ${MIN_REVIEW_CHARS} characters and a few words.`
+          : m.includes('comment_looks_like_spam')
+          ? 'Please write a real review, not repeated characters.'
+          : m.includes('no_links')
+          ? 'Please remove web links from your review.'
+          : m.includes('comment_too_long')
+          ? `Reviews can be up to ${MAX_REVIEW_CHARS} characters.`
+          : 'Could not save your review. Please try again.'
       );
       return;
     }
@@ -872,14 +898,18 @@ export default function UKHalalAppMapbox() {
     setSubmittingReview(false);
     setReviewProgress('');
     setShowReviewModal(false);
+    const pointsAfter = await refreshPoints(user.id);
+    const gained =
+      pointsAfter != null && pointsAfter > pointsBefore
+        ? ` You earned ${pointsAfter - pointsBefore} points.`
+        : '';
     setNotice(
       failed > 0
-        ? `Rating saved, but ${failed} photo${failed > 1 ? 's' : ''} could not be uploaded.`
-        : 'Thanks! Your rating is live.'
+        ? `Saved, but ${failed} photo${failed > 1 ? 's' : ''} could not be uploaded.${gained}`
+        : `Thanks! Your review is live.${gained}`
     );
     setReviewsVersion((v) => v + 1);
     refreshRatings();
-    refreshPoints(user.id);
   };
 
   const handleRemovePhoto = async (photoId: number) => {
@@ -1494,7 +1524,10 @@ export default function UKHalalAppMapbox() {
           <div className="flex items-center gap-3">
             {user && (
               <button
-                onClick={() => setShowProfileModal(true)}
+                onClick={() => {
+                  setShowProfileModal(true);
+                  if (user) refreshPoints(user.id);
+                }}
                 className="flex items-center gap-2 bg-slate-800/90 hover:bg-slate-800 px-3.5 py-1.5 rounded-full text-xs border border-slate-700 shadow-inner transition cursor-pointer"
               >
                 <Award className="w-4 h-4 text-amber-400" />
@@ -1747,6 +1780,11 @@ export default function UKHalalAppMapbox() {
                                   {Number(rev.rating).toFixed(1)}
                                 </span>
                               </div>
+                              {rev.comment && (
+                                <p className="text-xs text-slate-300 whitespace-pre-wrap break-words">
+                                  {rev.comment}
+                                </p>
+                              )}
                               <ReviewPhotoStrip
                                 photos={rev.photos}
                                 urls={photoUrls}
@@ -2234,7 +2272,7 @@ export default function UKHalalAppMapbox() {
                                   className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border border-slate-700 bg-slate-800 text-slate-200 hover:bg-slate-700 transition"
                                 >
                                   <MessageSquare className="w-3.5 h-3.5 text-emerald-400" />
-                                  {myReview ? 'Edit your rating' : 'Rate & add photos'}
+                                  {myReview ? 'Edit your review' : 'Rate & review'}
                                 </button>
                                 <button
                                   onClick={openReportModal}
@@ -2248,7 +2286,7 @@ export default function UKHalalAppMapbox() {
 
                               {reviews.length === 0 ? (
                                 <p className="text-xs text-slate-500">
-                                  No ratings yet. Be the first to rate this place.
+                                  No reviews yet. Be the first to rate this place.
                                 </p>
                               ) : (
                                 <ul className="space-y-2">
@@ -2271,6 +2309,11 @@ export default function UKHalalAppMapbox() {
                                           {Number(rev.rating).toFixed(1)}
                                         </span>
                                       </div>
+                                      {rev.comment && (
+                                        <p className="text-slate-300 whitespace-pre-wrap break-words">
+                                          {rev.comment}
+                                        </p>
+                                      )}
                                       <ReviewPhotoStrip
                                         photos={rev.photos}
                                         urls={photoUrls}
@@ -2756,6 +2799,42 @@ export default function UKHalalAppMapbox() {
               </p>
             </div>
 
+            <div className="space-y-1 border-t border-slate-800 pt-3">
+              <label className="text-xs text-slate-300 font-medium">
+                Write a review (optional)
+              </label>
+              <textarea
+                value={reviewComment}
+                onChange={(e) => setReviewComment(e.target.value)}
+                maxLength={MAX_REVIEW_CHARS}
+                rows={4}
+                placeholder="What did you eat? How was the service? Anything others should know?"
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white"
+              />
+              {(() => {
+                const n = reviewComment.replace(/\s+/g, ' ').trim().length;
+                return (
+                  <p
+                    className={`text-[11px] ${
+                      n === 0
+                        ? 'text-slate-500'
+                        : n >= MIN_REVIEW_CHARS
+                        ? 'text-emerald-400'
+                        : 'text-amber-300'
+                    }`}
+                  >
+                    {n === 0
+                      ? `Write ${MIN_REVIEW_CHARS}+ characters to earn 5 points.`
+                      : n >= MIN_REVIEW_CHARS
+                      ? 'Great, this earns 5 points.'
+                      : `${MIN_REVIEW_CHARS - n} more character${
+                          MIN_REVIEW_CHARS - n === 1 ? '' : 's'
+                        } to go.`}
+                  </p>
+                );
+              })()}
+            </div>
+
             <div className="space-y-3 border-t border-slate-800 pt-3">
               <p className="text-xs text-slate-400">
                 Quick questions (optional). When enough people agree, they show
@@ -2854,10 +2933,13 @@ export default function UKHalalAppMapbox() {
             )}
 
             <p className="text-[10px] text-slate-500 leading-relaxed">
-              Ratings and photos are public and show your username. Only upload
-              your own photos of the food or the restaurant, and avoid showing
-              other people. Photos are resized and location data is removed
-              before upload. Photos can be reported and removed.
+              Reviews, ratings and photos are public and show your username. Be
+              honest and respectful, and don&apos;t include web links or personal
+              details. Only upload your own photos of the food or the restaurant,
+              and avoid showing other people. Photos are resized and location
+              data is removed before upload. Anything can be reported and
+              removed. A written review earns 5 points, and each thumbs up on
+              your review earns you 1 more.
             </p>
 
             <div className="flex justify-end gap-2 pt-2 border-t border-slate-800">
