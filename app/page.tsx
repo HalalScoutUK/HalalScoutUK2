@@ -186,6 +186,7 @@ export default function UKHalalAppMapbox() {
     zoom: 14.2,
   });
   const [locationStatus, setLocationStatus] = useState('Detecting GPS...');
+
   const [restaurants, setRestaurants] = useState<any[]>([]);
   const [activeRestaurantId, setActiveRestaurantId] = useState<number | null>(
     null
@@ -216,6 +217,10 @@ export default function UKHalalAppMapbox() {
   const [claimError, setClaimError] = useState('');
   const [claiming, setClaiming] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [team, setTeam] = useState<
+    { user_id: string; username: string; is_you: boolean }[]
+  >([]);
+  const [teamError, setTeamError] = useState('');
 
   const [notice, setNotice] = useState('');
 
@@ -394,15 +399,14 @@ export default function UKHalalAppMapbox() {
 
   useEffect(() => {
     async function fetchRestaurants() {
-      const { data, error } = await supabase.from('restaurants').select('*');
-      console.log('restaurants result', { count: data?.length, error });
-    
+      const { data, error } = await supabase
+        .from('restaurants')
+        .select(RESTAURANT_COLUMNS);
       if (error) {
         console.error('Error fetching restaurants:', error.message);
-        setNotice('Could not load restaurants: ' + error.message);
+        setNotice('Could not load restaurants. Please refresh.');
         return;
       }
-      // ...rest of the function stays the same
       if (data && data.length > 0) {
         const formatted = (data as any[])
           .filter(
@@ -440,6 +444,31 @@ export default function UKHalalAppMapbox() {
 
   const ownedRestaurant =
     restaurants.find((r) => ownedRestaurantIds.includes(r.id)) || null;
+
+  // Who has access to this shop's owner portal (only owners can ask)
+  useEffect(() => {
+    if (!ownedRestaurant || role !== 'OWNER') {
+      setTeam([]);
+      return;
+    }
+    let cancelled = false;
+    supabase
+      .rpc('get_restaurant_team', { p_restaurant_id: ownedRestaurant.id })
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          setTeamError('Could not load who has access.');
+          setTeam([]);
+        } else {
+          setTeamError('');
+          setTeam((data as any[]) ?? []);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ownedRestaurant?.id, role]);
 
   // Prefill the owner edit form from the owner's own restaurant
   useEffect(() => {
@@ -946,6 +975,39 @@ export default function UKHalalAppMapbox() {
                           View Official Registry ↗
                         </a>
                       </div>
+                    </div>
+
+                    {/* People with access */}
+                    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-3 shadow-2xl">
+                      <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                        <UserCheck className="w-4 h-4 text-amber-400" /> People
+                        with access ({team.length})
+                      </h3>
+                      <p className="text-xs text-slate-400">
+                        Everyone listed here can edit this shop&apos;s profile and
+                        photos.
+                      </p>
+                      {teamError ? (
+                        <p className="text-xs text-rose-400">{teamError}</p>
+                      ) : (
+                        <ul className="space-y-1.5">
+                          {team.map((m) => (
+                            <li
+                              key={m.user_id}
+                              className="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs"
+                            >
+                              <span className="font-semibold text-white">
+                                @{m.username}
+                              </span>
+                              {m.is_you && (
+                                <span className="text-[10px] font-bold text-amber-300 bg-amber-400/20 border border-amber-400/40 px-2 py-0.5 rounded">
+                                  You
+                                </span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
                     </div>
 
                     {/* Media preview */}
