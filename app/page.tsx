@@ -401,7 +401,7 @@ export default function UKHalalAppMapbox() {
     async function fetchRestaurants() {
       const { data, error } = await supabase
         .from('restaurants')
-        .select(RESTAURANT_COLUMNS);
+        .select('*');
       if (error) {
         console.error('Error fetching restaurants:', error.message);
         setNotice('Could not load restaurants. Please refresh.');
