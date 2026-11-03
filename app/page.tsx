@@ -26,6 +26,11 @@ import {
   Crosshair,
   ChevronRight,
   ChevronLeft,
+  Play,
+  Maximize2,
+  Volume2,
+  VolumeX,
+  Send,
   X,
   Star,
   Heart,
@@ -303,12 +308,58 @@ async function resizeImage(
 }
 
 // ---------------------------------------------------------------------------
-// Photo viewer: a full-screen pop-up inside the app. The photo grows out of its
-// thumbnail, you can swipe or use the arrow keys between photos, tap to zoom,
-// drag down to dismiss, and it shrinks back into the thumbnail on close.
+// Media viewer: any image or video opens as a full-screen pop-up inside the
+// app. The picture grows out of where it was tapped, you can swipe or use the
+// arrow keys between items, tap to zoom a photo, drag down to dismiss, and it
+// shrinks back to where it came from on close. Videos play with controls.
 // ---------------------------------------------------------------------------
 
+type MediaItem = {
+  src: string;
+  type: 'image' | 'video';
+  label?: string;
+  key?: MediaKey; // which photo slot it came from (used for video likes/comments)
+};
+
+// What a video needs in order to offer likes and comments
+type VideoCommunity = {
+  restaurantId: number;
+  supabase: any;
+  user: any;
+  notify: (message: string) => void;
+};
+
+// How many seconds of a video the silent preview loops through
+const PREVIEW_SECONDS = 5;
+
 const LB_EASE = 'cubic-bezier(0.22, 1, 0.36, 1)';
+
+// Owners paste links, so work out from the link whether it's a video file
+function mediaTypeOf(url: string): 'image' | 'video' {
+  return /\.(mp4|webm|mov|m4v|ogv)(\?|#|$)/i.test(url) ? 'video' : 'image';
+}
+
+// A restaurant's pictures and videos, in the same order as the tabs
+function restaurantMediaItems(media: any): {
+  items: MediaItem[];
+  keys: MediaKey[];
+} {
+  const items: MediaItem[] = [];
+  const keys: MediaKey[] = [];
+  MEDIA_TABS.forEach((m) => {
+    const url = media?.[m.key];
+    if (typeof url === 'string' && url.trim()) {
+      items.push({
+        src: url.trim(),
+        type: mediaTypeOf(url),
+        label: m.label,
+        key: m.key,
+      });
+      keys.push(m.key);
+    }
+  });
+  return { items, keys };
+}
 
 function rectIsOnScreen(r: DOMRect) {
   return (
@@ -321,20 +372,130 @@ function rectIsOnScreen(r: DOMRect) {
   );
 }
 
-function PhotoLightbox({
-  images,
+// A silent, looping preview of a video's first few seconds (like a short clip
+// on a feed). It only plays while it's on screen, to save battery and data.
+function LoopingPreview({
+  src,
+  label,
+  className,
+}: {
+  src: string;
+  label: string;
+  className: string;
+}) {
+  const ref = useRef<HTMLVideoElement>(null);
+  const [reducedMotion, setReducedMotion] = useState(false);
+
+  useEffect(() => {
+    const v = ref.current;
+    if (!v) return;
+    if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      setReducedMotion(true);
+      return;
+    }
+    v.muted = true;
+    let raf = 0;
+    const tick = () => {
+      if (v.currentTime >= PREVIEW_SECONDS) v.currentTime = 0;
+      raf = requestAnimationFrame(tick);
+    };
+    const start = () => {
+      const played = v.play();
+      if (played && typeof played.then === 'function') {
+        played
+          .then(() => {
+            cancelAnimationFrame(raf);
+            raf = requestAnimationFrame(tick);
+          })
+          .catch(() => {});
+      }
+    };
+    const stop = () => {
+      cancelAnimationFrame(raf);
+      v.pause();
+    };
+    const io = new IntersectionObserver(
+      ([entry]) => (entry.isIntersecting ? start() : stop()),
+      { threshold: 0.4 }
+    );
+    io.observe(v);
+    return () => {
+      io.disconnect();
+      cancelAnimationFrame(raf);
+      v.pause();
+    };
+  }, [src]);
+
+  return (
+    <>
+      <video
+        ref={ref}
+        src={reducedMotion ? `${src}#t=0.1` : src}
+        muted
+        loop
+        playsInline
+        preload="metadata"
+        aria-label={label}
+        className={className}
+      />
+      <span className="absolute top-2 left-2 flex items-center gap-1 bg-slate-900/70 border border-slate-600 text-white text-[10px] font-bold px-2 py-0.5 rounded-full backdrop-blur pointer-events-none">
+        <Play className="w-2.5 h-2.5 fill-current" /> Video
+      </span>
+    </>
+  );
+}
+
+// A picture, or a video (looping silently, or a still frame when small)
+function MediaPreview({
+  item,
+  alt,
+  className,
+  small = false,
+}: {
+  item: MediaItem;
+  alt: string;
+  className: string;
+  small?: boolean;
+}) {
+  if (item.type === 'video') {
+    if (!small) {
+      return <LoopingPreview src={item.src} label={alt} className={className} />;
+    }
+    return (
+      <>
+        <video
+          src={`${item.src}#t=0.1`}
+          muted
+          playsInline
+          preload="metadata"
+          aria-label={alt}
+          className={className}
+        />
+        <span className="absolute inset-0 flex items-center justify-center pointer-events-none">
+          <span className="w-5 h-5 rounded-full bg-slate-900/70 border border-slate-500 backdrop-blur flex items-center justify-center">
+            <Play className="w-2.5 h-2.5 text-white fill-current" />
+          </span>
+        </span>
+      </>
+    );
+  }
+  return <img src={item.src} alt={alt} loading="lazy" className={className} />;
+}
+
+function MediaLightbox({
+  items,
   startIndex,
   caption,
   getThumbRect,
   onClose,
 }: {
-  images: string[];
+  items: MediaItem[];
   startIndex: number;
   caption?: string;
   getThumbRect: (i: number) => DOMRect | null;
   onClose: () => void;
 }) {
-  const total = images.length;
+  const total = items.length;
   const [index, setIndex] = useState(startIndex);
   const [direction, setDirection] = useState<1 | -1 | 0>(0);
   const [visible, setVisible] = useState(false);
@@ -347,6 +508,7 @@ function PhotoLightbox({
 
   const heroRef = useRef<HTMLDivElement>(null);
   const imgRef = useRef<HTMLImageElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const closeBtnRef = useRef<HTMLButtonElement>(null);
   const heroDone = useRef(false);
   const closing = useRef(false);
@@ -359,12 +521,23 @@ function PhotoLightbox({
     axis: 'x' | 'y' | null;
   }>({ x: 0, y: 0, dx: 0, axis: null });
 
+  const item = items[index];
+  const isVideo = item.type === 'video';
+
   const reduceMotion =
     typeof window !== 'undefined' &&
     !!window.matchMedia &&
     window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
-  // Moves the photo between its thumbnail's position and the centre of the screen
+  const mediaIsReady = () => {
+    const current = items[indexRef.current];
+    if (current.type === 'video') {
+      return !!videoRef.current && videoRef.current.videoWidth > 0;
+    }
+    return !!imgRef.current && imgRef.current.naturalWidth > 0;
+  };
+
+  // Moves the media between its original spot and the centre of the screen
   const flyTo = (thumb: DOMRect, toThumb: boolean) => {
     const hero = heroRef.current;
     if (!hero) return false;
@@ -394,9 +567,7 @@ function PhotoLightbox({
   };
 
   const startHero = () => {
-    if (heroDone.current) return;
-    const img = imgRef.current;
-    if (!img || !img.naturalWidth) return;
+    if (heroDone.current || !mediaIsReady()) return;
     heroDone.current = true;
     const thumb = getThumbRect(startIndex);
     if (!reduceMotion && thumb && rectIsOnScreen(thumb)) flyTo(thumb, false);
@@ -409,6 +580,7 @@ function PhotoLightbox({
     const thumb = getThumbRect(indexRef.current);
     setZoomed(false);
     setVisible(false);
+    videoRef.current?.pause();
     let flew = false;
     if (!viaDrag && !reduceMotion && thumb && rectIsOnScreen(thumb)) {
       flew = flyTo(thumb, true);
@@ -439,8 +611,7 @@ function PhotoLightbox({
   latest.current = { go, close: () => requestClose() };
 
   useLayoutEffect(() => {
-    const img = imgRef.current;
-    if (img && img.complete && img.naturalWidth) {
+    if (mediaIsReady()) {
       setLoaded((l) => ({ ...l, [startIndex]: true }));
       startHero();
     }
@@ -452,11 +623,14 @@ function PhotoLightbox({
       if (e.key === 'Escape') {
         e.preventDefault();
         latest.current.close();
-      } else if (e.key === 'ArrowRight') {
-        latest.current.go(1);
-      } else if (e.key === 'ArrowLeft') {
-        latest.current.go(-1);
+        return;
       }
+      // leave the arrow keys alone while a video has focus (they seek the video)
+      if ((document.activeElement as HTMLElement | null)?.tagName === 'VIDEO') {
+        return;
+      }
+      if (e.key === 'ArrowRight') latest.current.go(1);
+      else if (e.key === 'ArrowLeft') latest.current.go(-1);
     };
     window.addEventListener('keydown', onKey);
     const previousOverflow = document.body.style.overflow;
@@ -470,14 +644,17 @@ function PhotoLightbox({
     };
   }, []);
 
-  // Load the neighbouring photos in advance so swiping feels instant
+  // Load the neighbouring pictures in advance so swiping feels instant
   useEffect(() => {
     if (total < 2) return;
     [index + 1, index - 1].forEach((i) => {
-      const im = new Image();
-      im.src = images[(i + total) % total];
+      const next = items[(i + total) % total];
+      if (next.type === 'image') {
+        const im = new Image();
+        im.src = next.src;
+      }
     });
-  }, [index, images, total]);
+  }, [index, items, total]);
 
   const panTo = (clientX: number, clientY: number) => {
     const box = heroRef.current?.getBoundingClientRect();
@@ -493,14 +670,15 @@ function PhotoLightbox({
     setZoomed((z) => !z);
   };
 
+  // Swipe gestures are for pictures only, so they never fight a video's controls
   const onTouchStart = (e: React.TouchEvent) => {
-    if (e.touches.length !== 1) return;
+    if (isVideo || e.touches.length !== 1) return;
     const t = e.touches[0];
     touch.current = { x: t.clientX, y: t.clientY, dx: 0, axis: null };
   };
 
   const onTouchMove = (e: React.TouchEvent) => {
-    if (e.touches.length !== 1) return;
+    if (isVideo || e.touches.length !== 1) return;
     const t = e.touches[0];
     if (zoomed) {
       panTo(t.clientX, t.clientY);
@@ -519,6 +697,7 @@ function PhotoLightbox({
   };
 
   const onTouchEnd = () => {
+    if (isVideo) return;
     const { axis, dx } = touch.current;
     touch.current.axis = null;
     if (axis === 'x' && Math.abs(dx) > 50) {
@@ -536,16 +715,19 @@ function PhotoLightbox({
     opacity: visible ? 1 : 0,
     transition: `opacity 300ms ease-out ${extra}`,
   });
+  const fullCaption = [caption, item.label].filter(Boolean).join(' · ');
+  const mediaClasses =
+    'block object-contain max-w-[92vw] max-h-[calc(100vh-12rem)]';
 
   return createPortal(
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Photo viewer"
+      aria-label={isVideo ? 'Video viewer' : 'Photo viewer'}
       className="fixed inset-0 z-[70] select-none"
       onClick={(e) => e.stopPropagation()}
     >
-      {/* Backdrop: fades, and gets lighter as you drag the photo down */}
+      {/* Backdrop: fades, and gets lighter as you drag the picture down */}
       <div
         className="absolute inset-0 bg-slate-950/95 backdrop-blur-md"
         style={{
@@ -569,7 +751,7 @@ function PhotoLightbox({
         )}
         {failed[index] && (
           <p className="absolute text-xs text-slate-400">
-            Sorry, this photo couldn&apos;t be loaded.
+            Sorry, this {isVideo ? 'video' : 'photo'} couldn&apos;t be loaded.
           </p>
         )}
 
@@ -596,30 +778,51 @@ function PhotoLightbox({
               transition: dragging ? 'none' : 'transform 250ms ease-out',
             }}
           >
-            <img
-              ref={imgRef}
-              src={images[index]}
-              alt={`Photo ${index + 1} of ${total}`}
-              draggable={false}
-              onLoad={() => {
-                setLoaded((l) => ({ ...l, [index]: true }));
-                startHero();
-              }}
-              onError={() => setFailed((f) => ({ ...f, [index]: true }))}
-              onClick={onImageClick}
-              onMouseMove={(e) => {
-                if (zoomed) panTo(e.clientX, e.clientY);
-              }}
-              className={`block object-contain max-w-[92vw] max-h-[calc(100vh-12rem)] ${
-                zoomed ? 'cursor-zoom-out' : 'cursor-zoom-in'
-              }`}
-              style={{
-                opacity: loaded[index] ? 1 : 0,
-                transform: zoomed ? 'scale(2.2)' : 'scale(1)',
-                transformOrigin: `${origin.x}% ${origin.y}%`,
-                transition: `opacity 250ms ease-out, transform 300ms ${LB_EASE}, transform-origin 120ms ease-out`,
-              }}
-            />
+            {isVideo ? (
+              <video
+                ref={videoRef}
+                src={item.src}
+                controls
+                autoPlay
+                playsInline
+                onLoadedMetadata={() => {
+                  setLoaded((l) => ({ ...l, [index]: true }));
+                  startHero();
+                }}
+                onError={() => setFailed((f) => ({ ...f, [index]: true }))}
+                onClick={(e) => e.stopPropagation()}
+                className={`${mediaClasses} bg-black`}
+                style={{
+                  opacity: loaded[index] ? 1 : 0,
+                  transition: 'opacity 250ms ease-out',
+                }}
+              />
+            ) : (
+              <img
+                ref={imgRef}
+                src={item.src}
+                alt={item.label ? `${item.label} (${index + 1} of ${total})` : `Photo ${index + 1} of ${total}`}
+                draggable={false}
+                onLoad={() => {
+                  setLoaded((l) => ({ ...l, [index]: true }));
+                  startHero();
+                }}
+                onError={() => setFailed((f) => ({ ...f, [index]: true }))}
+                onClick={onImageClick}
+                onMouseMove={(e) => {
+                  if (zoomed) panTo(e.clientX, e.clientY);
+                }}
+                className={`${mediaClasses} ${
+                  zoomed ? 'cursor-zoom-out' : 'cursor-zoom-in'
+                }`}
+                style={{
+                  opacity: loaded[index] ? 1 : 0,
+                  transform: zoomed ? 'scale(2.2)' : 'scale(1)',
+                  transformOrigin: `${origin.x}% ${origin.y}%`,
+                  transition: `opacity 250ms ease-out, transform 300ms ${LB_EASE}, transform-origin 120ms ease-out`,
+                }}
+              />
+            )}
           </div>
         </div>
       </div>
@@ -636,7 +839,7 @@ function PhotoLightbox({
           ref={closeBtnRef}
           type="button"
           onClick={() => requestClose()}
-          aria-label="Close photo viewer"
+          aria-label="Close viewer"
           className={`${glass} pointer-events-auto`}
         >
           <X className="w-5 h-5" />
@@ -649,7 +852,7 @@ function PhotoLightbox({
           <button
             type="button"
             onClick={() => go(-1)}
-            aria-label="Previous photo"
+            aria-label="Previous"
             className={`${glass} absolute left-3 top-1/2 -translate-y-1/2 z-10`}
             style={fade()}
           >
@@ -658,7 +861,7 @@ function PhotoLightbox({
           <button
             type="button"
             onClick={() => go(1)}
-            aria-label="Next photo"
+            aria-label="Next"
             className={`${glass} absolute right-3 top-1/2 -translate-y-1/2 z-10`}
             style={fade()}
           >
@@ -672,29 +875,29 @@ function PhotoLightbox({
         className="absolute bottom-0 inset-x-0 px-4 pb-5 pt-3 z-10 flex flex-col items-center gap-3 pointer-events-none"
         style={fade('80ms')}
       >
-        {caption && (
+        {fullCaption && (
           <p className="text-xs font-semibold text-slate-200 bg-slate-900/70 border border-slate-700 rounded-full px-3 py-1.5 backdrop-blur max-w-full truncate">
-            {caption}
+            {fullCaption}
           </p>
         )}
         {total > 1 && (
           <div className="pointer-events-auto flex gap-2 overflow-x-auto max-w-full p-1">
-            {images.map((src, i) => (
+            {items.map((it, i) => (
               <button
-                key={src}
+                key={`${i}-${it.src}`}
                 type="button"
                 onClick={() => goTo(i)}
-                aria-label={`Show photo ${i + 1}`}
-                className={`shrink-0 w-12 h-12 rounded-lg overflow-hidden border-2 transition ${
+                aria-label={`Show item ${i + 1}`}
+                className={`relative shrink-0 w-12 h-12 rounded-lg overflow-hidden border-2 transition ${
                   i === index
                     ? 'border-emerald-400 scale-110'
                     : 'border-transparent opacity-60 hover:opacity-100'
                 }`}
               >
-                <img
-                  src={src}
+                <MediaPreview
+                  item={it}
                   alt=""
-                  draggable={false}
+                  small
                   className="w-full h-full object-cover"
                 />
               </button>
@@ -702,11 +905,859 @@ function PhotoLightbox({
           </div>
         )}
         <p className="hidden sm:block text-[10px] text-slate-500">
-          Click the photo to zoom · arrow keys to browse · Esc to close
+          {isVideo
+            ? 'Esc to close'
+            : 'Click the photo to zoom · arrow keys to browse · Esc to close'}
         </p>
       </div>
     </div>,
     document.body
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Video reel: a full-screen, TikTok-style player. Sound is on, tap pauses,
+// double-tap likes, swipe up or down moves between a restaurant's videos, and
+// the like and comment buttons sit quietly on the right edge, fading back
+// when you're just watching.
+// ---------------------------------------------------------------------------
+
+function compactCount(n: number) {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, '')}K`;
+  return String(n);
+}
+
+function timeAgoShort(iso: string) {
+  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  if (s < 60) return 'now';
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  if (s < 86400) return `${Math.floor(s / 3600)}h`;
+  if (s < 2592000) return `${Math.floor(s / 86400)}d`;
+  return new Date(iso).toLocaleDateString('en-GB', {
+    month: 'short',
+    year: 'numeric',
+  });
+}
+
+// Grows or shrinks an element between a smaller on-screen rectangle and its own
+function flyElement(hero: HTMLElement, thumb: DOMRect, toThumb: boolean) {
+  const box = hero.getBoundingClientRect();
+  if (box.width < 10 || box.height < 10) return false;
+  const s = Math.max(thumb.width / box.width, thumb.height / box.height);
+  const dx = thumb.left + thumb.width / 2 - (box.left + box.width / 2);
+  const dy = thumb.top + thumb.height / 2 - (box.top + box.height / 2);
+  const cropX = Math.max(0, (box.width * s - thumb.width) / 2 / s);
+  const cropY = Math.max(0, (box.height * s - thumb.height) / 2 / s);
+  const small = `translate(${dx}px, ${dy}px) scale(${s})`;
+  const smallClip = `inset(${cropY}px ${cropX}px round ${12 / s}px)`;
+  if (!toThumb) {
+    hero.style.transition = 'none';
+    hero.style.transform = small;
+    hero.style.clipPath = smallClip;
+    void hero.offsetWidth;
+  }
+  hero.style.transition = `transform 420ms ${LB_EASE}, clip-path 420ms ${LB_EASE}`;
+  hero.style.transform = toThumb ? small : 'translate(0px, 0px) scale(1)';
+  hero.style.clipPath = toThumb ? smallClip : 'inset(0px 0px round 0px)';
+  return true;
+}
+
+function VideoComments({
+  community,
+  mediaKey,
+  onCountChange,
+  onClose,
+}: {
+  community: VideoCommunity;
+  mediaKey: string;
+  onCountChange: (delta: number) => void;
+  onClose: () => void;
+}) {
+  const { supabase, user, restaurantId, notify } = community;
+  const [comments, setComments] = useState<any[] | null>(null);
+  const [text, setText] = useState('');
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState('');
+
+  const load = async () => {
+    const { data, error: err } = await supabase.rpc('get_video_comments', {
+      p_restaurant_id: restaurantId,
+      p_media_key: mediaKey,
+    });
+    setComments(err ? [] : ((data as any[]) ?? []));
+  };
+
+  useEffect(() => {
+    setComments(null);
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mediaKey]);
+
+  const send = async () => {
+    const body = text.trim();
+    if (!body || sending) return;
+    setSending(true);
+    setError('');
+    const { error: err } = await supabase.rpc('add_video_comment', {
+      p_restaurant_id: restaurantId,
+      p_media_key: mediaKey,
+      p_body: body,
+    });
+    setSending(false);
+    if (err) {
+      const m = err.message || '';
+      setError(
+        m.includes('no_links')
+          ? 'Please remove web links from your comment.'
+          : m.includes('comment_looks_like_spam')
+          ? 'Please write a real comment.'
+          : m.includes('comment_too_long')
+          ? 'Comments can be up to 300 characters.'
+          : m.includes('rate_limited')
+          ? 'You have posted a lot of comments today. Please try again tomorrow.'
+          : m.includes('username_required')
+          ? 'Please choose a username first.'
+          : 'Could not post your comment. Please try again.'
+      );
+      return;
+    }
+    setText('');
+    onCountChange(1);
+    load();
+  };
+
+  const remove = async (id: number) => {
+    if (!window.confirm('Delete your comment?')) return;
+    const { error: err } = await supabase.rpc('delete_my_video_comment', {
+      p_id: id,
+    });
+    if (err) {
+      notify('Could not delete your comment.');
+      return;
+    }
+    onCountChange(-1);
+    load();
+  };
+
+  const report = async (id: number) => {
+    if (!window.confirm('Report this comment to the moderators?')) return;
+    const { error: err } = await supabase.rpc('report_video_comment', {
+      p_comment_id: id,
+      p_reason: 'reported by user',
+    });
+    notify(err ? 'Could not send your report.' : 'Thanks, we will take a look.');
+  };
+
+  return (
+    <div
+      className="absolute inset-x-0 bottom-0 z-30 flex flex-col bg-slate-900/95 backdrop-blur-xl border-t border-slate-700 rounded-t-2xl lb-sheet"
+      style={{ height: 'min(62%, 560px)' }}
+      onClick={(e) => e.stopPropagation()}
+      onTouchStart={(e) => e.stopPropagation()}
+      onTouchEnd={(e) => e.stopPropagation()}
+      onWheel={(e) => e.stopPropagation()}
+    >
+      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-800">
+        <h3 className="text-sm font-bold text-white">
+          Comments{comments ? ` (${comments.length})` : ''}
+        </h3>
+        <button
+          type="button"
+          onClick={onClose}
+          aria-label="Close comments"
+          className="text-slate-400 hover:text-white"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+
+      <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+        {comments === null ? (
+          <div className="flex justify-center py-6">
+            <div className="w-6 h-6 rounded-full border-2 border-slate-600 border-t-emerald-400 animate-spin" />
+          </div>
+        ) : comments.length === 0 ? (
+          <p className="text-xs text-slate-500 text-center py-6">
+            No comments yet.{user ? ' Say something nice.' : ''}
+          </p>
+        ) : (
+          comments.map((c) => (
+            <div key={c.id} className="space-y-0.5">
+              <div className="flex items-center gap-2 text-[11px]">
+                <span className="font-bold text-white">@{c.username}</span>
+                {c.is_owner && (
+                  <span className="text-[9px] font-bold text-amber-300 bg-amber-400/15 border border-amber-400/40 px-1.5 py-px rounded">
+                    Owner
+                  </span>
+                )}
+                <span className="text-slate-500">{timeAgoShort(c.created_at)}</span>
+                {user && (
+                  <span className="ml-auto text-slate-500">
+                    {c.is_mine ? (
+                      <button
+                        type="button"
+                        onClick={() => remove(c.id)}
+                        className="hover:text-rose-400"
+                      >
+                        Delete
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => report(c.id)}
+                        className="hover:text-white"
+                      >
+                        Report
+                      </button>
+                    )}
+                  </span>
+                )}
+              </div>
+              <p className="text-xs text-slate-200 break-words whitespace-pre-wrap">
+                {c.body}
+              </p>
+            </div>
+          ))
+        )}
+      </div>
+
+      {user ? (
+        <div className="px-3 py-2.5 border-t border-slate-800 space-y-1">
+          {error && <p className="text-[11px] text-rose-400">{error}</p>}
+          <div className="flex items-center gap-2">
+            <input
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  send();
+                }
+              }}
+              maxLength={300}
+              placeholder="Add a comment..."
+              className="flex-1 bg-slate-950 border border-slate-700 rounded-full px-4 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
+            />
+            <button
+              type="button"
+              onClick={send}
+              disabled={sending || !text.trim()}
+              aria-label="Post comment"
+              className="w-9 h-9 rounded-full bg-emerald-500 text-slate-950 flex items-center justify-center disabled:opacity-40 active:scale-95 transition"
+            >
+              <Send className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      ) : (
+        <p className="px-4 py-3 border-t border-slate-800 text-[11px] text-slate-500 text-center">
+          Sign in to join the conversation.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function VideoReel({
+  items,
+  startIndex,
+  caption,
+  community,
+  getThumbRect,
+  onClose,
+}: {
+  items: MediaItem[];
+  startIndex: number;
+  caption?: string;
+  community?: VideoCommunity;
+  getThumbRect: () => DOMRect | null;
+  onClose: () => void;
+}) {
+  const total = items.length;
+  const [index, setIndex] = useState(startIndex);
+  const [direction, setDirection] = useState<1 | -1 | 0>(0);
+  const [visible, setVisible] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [paused, setPaused] = useState(false);
+  const [progress, setProgress] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const [idle, setIdle] = useState(false);
+  const [heart, setHeart] = useState<{ id: number; x: number; y: number } | null>(
+    null
+  );
+  const [stats, setStats] = useState<
+    Record<string, { likes: number; comments: number; liked: boolean }>
+  >({});
+  const [showComments, setShowComments] = useState(false);
+
+  const heroRef = useRef<HTMLDivElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const closeBtnRef = useRef<HTMLButtonElement>(null);
+  const heroDone = useRef(false);
+  const closing = useRef(false);
+  const tapTimer = useRef<number | null>(null);
+  const idleTimer = useRef<number | null>(null);
+  const lastWheel = useRef(0);
+  const touch = useRef({ x: 0, y: 0 });
+  const mutedRef = useRef(false);
+  mutedRef.current = muted;
+
+  const item = items[index];
+  const key = item.key;
+  const st = (key && stats[key]) || { likes: 0, comments: 0, liked: false };
+  const canLike = !!community?.user;
+  const reduceMotion =
+    typeof window !== 'undefined' &&
+    !!window.matchMedia &&
+    window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+  // ---- opening and closing
+  const startHero = () => {
+    if (heroDone.current) return;
+    heroDone.current = true;
+    const thumb = getThumbRect();
+    if (!reduceMotion && thumb && rectIsOnScreen(thumb) && heroRef.current) {
+      flyElement(heroRef.current, thumb, false);
+    }
+    setVisible(true);
+  };
+
+  const requestClose = () => {
+    if (closing.current) return;
+    closing.current = true;
+    videoRef.current?.pause();
+    const thumb = getThumbRect();
+    setVisible(false);
+    let flew = false;
+    if (!reduceMotion && thumb && rectIsOnScreen(thumb) && heroRef.current) {
+      flew = flyElement(heroRef.current, thumb, true);
+    }
+    if (!flew && heroRef.current) {
+      heroRef.current.style.transition = 'opacity 240ms ease-out';
+      heroRef.current.style.opacity = '0';
+    }
+    window.setTimeout(onClose, flew ? 420 : 250);
+  };
+
+  // ---- playback
+  const togglePlay = () => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.paused) v.play().catch(() => {});
+    else v.pause();
+  };
+
+  const toggleMute = () => {
+    const v = videoRef.current;
+    const next = !mutedRef.current;
+    setMuted(next);
+    if (v) v.muted = next;
+  };
+
+  const go = (delta: number) => {
+    if (total < 2) return;
+    setDirection(delta > 0 ? 1 : -1);
+    setShowComments(false);
+    setPaused(false);
+    setProgress(0);
+    setLoaded(false);
+    setFailed(false);
+    setIndex((i) => (i + delta + total) % total);
+  };
+
+  // Start the current video with sound; if the browser refuses, start muted
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    v.muted = mutedRef.current;
+    const attempt = v.play();
+    if (attempt && typeof attempt.catch === 'function') {
+      attempt.catch(() => {
+        v.muted = true;
+        setMuted(true);
+        v.play().catch(() => {});
+      });
+    }
+  }, [index]);
+
+  // If a video never reports in, don't leave the screen black
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      if (!heroDone.current) {
+        heroDone.current = true;
+        setVisible(true);
+      }
+    }, 2000);
+    return () => window.clearTimeout(t);
+  }, []);
+
+  // ---- likes and comments
+  useEffect(() => {
+    if (!community) return;
+    let cancelled = false;
+    community.supabase
+      .rpc('get_video_stats', { p_restaurant_id: community.restaurantId })
+      .then(({ data }: { data: any[] | null }) => {
+        if (cancelled || !data) return;
+        const map: Record<string, { likes: number; comments: number; liked: boolean }> = {};
+        data.forEach((row) => {
+          map[row.media_key] = {
+            likes: Number(row.like_count || 0),
+            comments: Number(row.comment_count || 0),
+            liked: !!row.liked_by_me,
+          };
+        });
+        setStats(map);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const setStat = (k: string, patch: Partial<{ likes: number; comments: number; liked: boolean }>) =>
+    setStats((prev) => ({
+      ...prev,
+      [k]: { likes: 0, comments: 0, liked: false, ...prev[k], ...patch },
+    }));
+
+  const doLike = async (onlyIfNotLiked = false) => {
+    if (!community || !community.user || !key) return;
+    const wasLiked = st.liked;
+    if (onlyIfNotLiked && wasLiked) return;
+    setStat(key, { liked: !wasLiked, likes: Math.max(0, st.likes + (wasLiked ? -1 : 1)) });
+    const { error } = await community.supabase.rpc('toggle_video_like', {
+      p_restaurant_id: community.restaurantId,
+      p_media_key: key,
+    });
+    if (error) {
+      setStat(key, { liked: wasLiked, likes: st.likes });
+      community.notify('Could not update your like. Please try again.');
+    }
+  };
+
+  const changeCommentCount = (delta: number) => {
+    if (!key) return;
+    setStat(key, { comments: Math.max(0, st.comments + delta) });
+  };
+
+  // ---- taps: one tap pauses, two taps like
+  const onStageTap = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    if (showComments) {
+      setShowComments(false);
+      return;
+    }
+    if (tapTimer.current) {
+      window.clearTimeout(tapTimer.current);
+      tapTimer.current = null;
+      if (canLike) {
+        const box = heroRef.current?.getBoundingClientRect();
+        if (box) {
+          setHeart({ id: Date.now(), x: e.clientX - box.left, y: e.clientY - box.top });
+          window.setTimeout(() => setHeart(null), 800);
+        }
+        doLike(true);
+      }
+      return;
+    }
+    tapTimer.current = window.setTimeout(() => {
+      tapTimer.current = null;
+      togglePlay();
+    }, 260);
+  };
+
+  // ---- fading the buttons back while you're just watching
+  const wake = () => {
+    setIdle(false);
+    if (idleTimer.current) window.clearTimeout(idleTimer.current);
+    idleTimer.current = window.setTimeout(() => setIdle(true), 3000);
+  };
+  useEffect(() => {
+    wake();
+    return () => {
+      if (idleTimer.current) window.clearTimeout(idleTimer.current);
+      if (tapTimer.current) window.clearTimeout(tapTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---- keyboard
+  const latest = useRef({
+    go,
+    close: requestClose,
+    togglePlay,
+    toggleMute,
+    commentsOpen: showComments,
+    closeComments: () => setShowComments(false),
+  });
+  latest.current = {
+    go,
+    close: requestClose,
+    togglePlay,
+    toggleMute,
+    commentsOpen: showComments,
+    closeComments: () => setShowComments(false),
+  };
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const typing =
+        (document.activeElement as HTMLElement | null)?.tagName === 'INPUT';
+      if (e.key === 'Escape') {
+        e.preventDefault();
+        if (latest.current.commentsOpen) latest.current.closeComments();
+        else latest.current.close();
+        return;
+      }
+      if (typing) return;
+      wake();
+      if (e.key === ' ') {
+        e.preventDefault();
+        latest.current.togglePlay();
+      } else if (e.key === 'm' || e.key === 'M') {
+        latest.current.toggleMute();
+      } else if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        latest.current.go(1);
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        latest.current.go(-1);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const previousFocus = document.activeElement as HTMLElement | null;
+    closeBtnRef.current?.focus();
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.body.style.overflow = previousOverflow;
+      previousFocus?.focus?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---- swipe up or down between videos (or swipe down to leave if there's one)
+  const onTouchStart = (e: React.TouchEvent) => {
+    wake();
+    if (e.touches.length === 1) {
+      touch.current = { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+  };
+  const onTouchEnd = (e: React.TouchEvent) => {
+    const t = e.changedTouches[0];
+    if (!t) return;
+    const dx = t.clientX - touch.current.x;
+    const dy = t.clientY - touch.current.y;
+    if (Math.abs(dy) > 60 && Math.abs(dy) > Math.abs(dx) * 1.3) {
+      if (total > 1) go(dy < 0 ? 1 : -1);
+      else if (dy > 0) requestClose();
+    }
+  };
+  const onWheel = (e: React.WheelEvent) => {
+    if (total < 2 || showComments) return;
+    const now = Date.now();
+    if (now - lastWheel.current < 700 || Math.abs(e.deltaY) < 30) return;
+    lastWheel.current = now;
+    go(e.deltaY > 0 ? 1 : -1);
+  };
+
+  const seek = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.stopPropagation();
+    const v = videoRef.current;
+    if (!v || !v.duration) return;
+    const box = e.currentTarget.getBoundingClientRect();
+    v.currentTime = Math.min(1, Math.max(0, (e.clientX - box.left) / box.width)) * v.duration;
+  };
+
+  const railBtn =
+    'w-11 h-11 rounded-full bg-black/25 backdrop-blur-sm flex items-center justify-center text-white transition active:scale-90 hover:bg-black/40';
+  const dim = idle && !showComments && !paused;
+  const fullCaption = [caption, item.label].filter(Boolean).join(' · ');
+
+  return createPortal(
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Video player"
+      className="fixed inset-0 z-[70] select-none"
+      onClick={(e) => e.stopPropagation()}
+      onMouseMove={wake}
+    >
+      <div
+        className="absolute inset-0 bg-black/95 backdrop-blur-md"
+        style={{ opacity: visible ? 1 : 0, transition: 'opacity 300ms ease-out' }}
+        onClick={() => requestClose()}
+      />
+
+      <div
+        ref={heroRef}
+        className="absolute inset-0 mx-auto w-full max-w-[560px] overflow-hidden bg-black sm:inset-y-4 sm:rounded-2xl sm:shadow-2xl"
+        style={{ opacity: visible ? 1 : 0, transition: 'opacity 150ms ease-out' }}
+        onWheel={onWheel}
+      >
+        {/* The video, and the layer that catches taps and swipes */}
+        <div
+          className="absolute inset-0"
+          onClick={onStageTap}
+          onTouchStart={onTouchStart}
+          onTouchEnd={onTouchEnd}
+        >
+          <div
+            key={index}
+            className={`absolute inset-0 ${
+              direction === 1 ? 'lb-slide-up' : direction === -1 ? 'lb-slide-down' : ''
+            }`}
+          >
+            <video
+              ref={videoRef}
+              src={item.src}
+              autoPlay
+              loop
+              playsInline
+              onLoadedMetadata={() => {
+                setLoaded(true);
+                startHero();
+              }}
+              onError={() => {
+                setFailed(true);
+                startHero();
+              }}
+              onPlay={() => setPaused(false)}
+              onPause={() => setPaused(true)}
+              onTimeUpdate={(e) => {
+                const v = e.currentTarget;
+                if (v.duration) setProgress(v.currentTime / v.duration);
+              }}
+              className="w-full h-full object-contain bg-black"
+            />
+          </div>
+
+          {!loaded && !failed && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <div className="w-8 h-8 rounded-full border-2 border-slate-600 border-t-emerald-400 animate-spin" />
+            </div>
+          )}
+          {failed && (
+            <p className="absolute inset-0 flex items-center justify-center text-xs text-slate-400 px-8 text-center">
+              Sorry, this video couldn&apos;t be loaded.
+            </p>
+          )}
+          {paused && loaded && !failed && (
+            <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+              <span className="w-16 h-16 rounded-full bg-black/40 backdrop-blur-sm flex items-center justify-center lb-pop">
+                <Play className="w-7 h-7 text-white fill-current" />
+              </span>
+            </div>
+          )}
+          {heart && (
+            <span
+              key={heart.id}
+              className="absolute pointer-events-none lb-heart"
+              style={{ left: heart.x, top: heart.y }}
+            >
+              <Heart className="w-20 h-20 text-rose-500 fill-rose-500 drop-shadow-lg" />
+            </span>
+          )}
+        </div>
+
+        {/* Soft shading so the text stays readable without hiding the video */}
+        <div
+          className="absolute inset-x-0 bottom-0 h-40 bg-gradient-to-t from-black/60 to-transparent pointer-events-none"
+          style={{ opacity: dim ? 0.5 : 1, transition: 'opacity 400ms' }}
+        />
+
+        {/* Top: sound and close */}
+        <div
+          className="absolute top-0 inset-x-0 z-20 flex items-center justify-between px-3 py-3 pointer-events-none"
+          style={{ opacity: dim ? 0.4 : 1, transition: 'opacity 400ms' }}
+        >
+          <button
+            type="button"
+            onClick={toggleMute}
+            aria-label={muted ? 'Turn sound on' : 'Turn sound off'}
+            className={`${railBtn} pointer-events-auto`}
+          >
+            {muted ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
+          </button>
+          <div className="flex items-center gap-2">
+            {total > 1 && (
+              <span className="text-[11px] font-semibold text-white bg-black/30 backdrop-blur-sm rounded-full px-2.5 py-1">
+                {index + 1} / {total}
+              </span>
+            )}
+            <button
+              ref={closeBtnRef}
+              type="button"
+              onClick={() => requestClose()}
+              aria-label="Close video"
+              className={`${railBtn} pointer-events-auto`}
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+        </div>
+
+        {/* Right edge: like and comment */}
+        {community && key && (
+          <div
+            className="absolute right-2 bottom-28 z-20 flex flex-col items-center gap-4 pointer-events-none"
+            style={{ opacity: dim ? 0.4 : 1, transition: 'opacity 400ms' }}
+          >
+            <div className="flex flex-col items-center gap-1">
+              {canLike ? (
+                <button
+                  type="button"
+                  onClick={() => doLike()}
+                  aria-label={st.liked ? 'Remove your like' : 'Like this video'}
+                  aria-pressed={st.liked}
+                  className={`${railBtn} pointer-events-auto`}
+                >
+                  <Heart
+                    className={`w-6 h-6 transition ${
+                      st.liked ? 'text-rose-500 fill-rose-500 scale-110' : ''
+                    }`}
+                  />
+                </button>
+              ) : (
+                <span className={railBtn} title="Sign in to like videos">
+                  <Heart className="w-6 h-6" />
+                </span>
+              )}
+              <span className="text-[11px] font-semibold text-white drop-shadow">
+                {compactCount(st.likes)}
+              </span>
+            </div>
+
+            <div className="flex flex-col items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setShowComments((v) => !v)}
+                aria-label="Comments"
+                className={`${railBtn} pointer-events-auto`}
+              >
+                <MessageSquare className="w-6 h-6" />
+              </button>
+              <span className="text-[11px] font-semibold text-white drop-shadow">
+                {compactCount(st.comments)}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Bottom left: what you're watching */}
+        {fullCaption && (
+          <div
+            className="absolute left-4 right-20 bottom-8 z-20 pointer-events-none"
+            style={{ opacity: dim ? 0.5 : 1, transition: 'opacity 400ms' }}
+          >
+            <p className="text-sm font-bold text-white drop-shadow truncate">
+              {fullCaption}
+            </p>
+            {muted && (
+              <p className="text-[11px] text-slate-200/80 drop-shadow">
+                Sound is off. Tap the speaker to turn it on.
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* Progress: thin line, tap it to jump */}
+        <div
+          className="absolute bottom-0 inset-x-0 h-5 z-20 flex items-end cursor-pointer"
+          onClick={seek}
+        >
+          <div className="w-full h-[3px] bg-white/20">
+            <div
+              className="h-full bg-white/80"
+              style={{ width: `${progress * 100}%` }}
+            />
+          </div>
+        </div>
+
+        {showComments && community && key && (
+          <VideoComments
+            community={community}
+            mediaKey={key}
+            onCountChange={changeCommentCount}
+            onClose={() => setShowComments(false)}
+          />
+        )}
+      </div>
+    </div>,
+    document.body
+  );
+}
+
+// Wraps any single picture or video so tapping it opens the right viewer:
+// pictures open the photo viewer, videos open the full-screen video player.
+function ViewableMedia({
+  items,
+  index,
+  caption,
+  className = '',
+  showHint = false,
+  community,
+  children,
+}: {
+  items: MediaItem[];
+  index: number;
+  caption?: string;
+  className?: string;
+  showHint?: boolean;
+  community?: VideoCommunity;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLButtonElement>(null);
+  const clicked = items[index];
+  const videos = items.filter((i) => i.type === 'video');
+  const images = items.filter((i) => i.type === 'image');
+  const rect = () => ref.current?.getBoundingClientRect() ?? null;
+
+  return (
+    <>
+      <button
+        type="button"
+        ref={ref}
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen(true);
+        }}
+        aria-label={clicked?.type === 'video' ? 'Play video full screen' : 'Open full screen'}
+        className={`group relative cursor-zoom-in focus:outline-none focus:ring-2 focus:ring-emerald-500 ${className}`}
+      >
+        {children}
+        {showHint && clicked?.type !== 'video' && (
+          <span className="absolute bottom-2 right-2 bg-slate-900/70 border border-slate-600 text-white p-1.5 rounded-full opacity-70 group-hover:opacity-100 transition pointer-events-none">
+            <Maximize2 className="w-3.5 h-3.5" />
+          </span>
+        )}
+      </button>
+      {open &&
+        clicked &&
+        (clicked.type === 'video' ? (
+          <VideoReel
+            items={videos}
+            startIndex={Math.max(0, videos.indexOf(clicked))}
+            caption={caption}
+            community={community}
+            getThumbRect={rect}
+            onClose={() => setOpen(false)}
+          />
+        ) : (
+          <MediaLightbox
+            items={images}
+            startIndex={Math.max(0, images.indexOf(clicked))}
+            caption={caption}
+            getThumbRect={rect}
+            onClose={() => setOpen(false)}
+          />
+        ))}
+    </>
   );
 }
 
@@ -751,8 +1802,8 @@ function ReviewPhotoStrip({
         ))}
       </div>
       {openIndex !== null && (
-        <PhotoLightbox
-          images={shown.map((p) => urls[p.path])}
+        <MediaLightbox
+          items={shown.map((p) => ({ src: urls[p.path], type: 'image' as const }))}
           startIndex={openIndex}
           caption={caption}
           getThumbRect={(i) =>
@@ -2113,9 +3164,85 @@ export default function UKHalalAppMapbox() {
         .lb-slide-prev {
           animation: lb-slide-prev 340ms cubic-bezier(0.22, 1, 0.36, 1);
         }
+        @keyframes lb-slide-up {
+          from {
+            opacity: 0;
+            transform: translateY(70px);
+          }
+          to {
+            opacity: 1;
+            transform: none;
+          }
+        }
+        @keyframes lb-slide-down {
+          from {
+            opacity: 0;
+            transform: translateY(-70px);
+          }
+          to {
+            opacity: 1;
+            transform: none;
+          }
+        }
+        @keyframes lb-sheet-up {
+          from {
+            transform: translateY(100%);
+          }
+          to {
+            transform: none;
+          }
+        }
+        @keyframes lb-heart {
+          0% {
+            opacity: 0;
+            transform: translate(-50%, -50%) scale(0.3);
+          }
+          25% {
+            opacity: 1;
+            transform: translate(-50%, -50%) scale(1.15);
+          }
+          60% {
+            opacity: 1;
+            transform: translate(-50%, -60%) scale(1);
+          }
+          100% {
+            opacity: 0;
+            transform: translate(-50%, -110%) scale(1);
+          }
+        }
+        @keyframes lb-pop {
+          from {
+            opacity: 0;
+            transform: scale(0.6);
+          }
+          to {
+            opacity: 1;
+            transform: scale(1);
+          }
+        }
+        .lb-slide-up {
+          animation: lb-slide-up 320ms cubic-bezier(0.22, 1, 0.36, 1);
+        }
+        .lb-slide-down {
+          animation: lb-slide-down 320ms cubic-bezier(0.22, 1, 0.36, 1);
+        }
+        .lb-sheet {
+          animation: lb-sheet-up 320ms cubic-bezier(0.22, 1, 0.36, 1);
+        }
+        .lb-heart {
+          animation: lb-heart 800ms ease-out forwards;
+        }
+        .lb-pop {
+          animation: lb-pop 180ms ease-out;
+        }
         @media (prefers-reduced-motion: reduce) {
           .lb-slide-next,
-          .lb-slide-prev {
+          .lb-slide-prev,
+          .lb-slide-up,
+          .lb-slide-down,
+          .lb-sheet,
+          .lb-heart,
+          .lb-pop {
             animation: none;
           }
         }
@@ -2582,13 +3709,36 @@ export default function UKHalalAppMapbox() {
                             <span className="text-xs text-slate-400 font-medium">
                               {m.label}
                             </span>
-                            <div className="h-40 w-full rounded-xl border border-slate-800 bg-slate-950 overflow-hidden flex items-center justify-center">
+                            <div className="relative h-40 w-full rounded-xl border border-slate-800 bg-slate-950 overflow-hidden flex items-center justify-center">
                               {ownedRestaurant.media?.[m.key] ? (
-                                <img
-                                  src={ownedRestaurant.media[m.key]}
-                                  alt={m.label}
-                                  className="w-full h-full object-cover"
-                                />
+                                (() => {
+                                  const { items, keys } = restaurantMediaItems(
+                                    ownedRestaurant.media
+                                  );
+                                  const idx = keys.indexOf(m.key);
+                                  if (idx < 0) return null;
+                                  return (
+                                    <ViewableMedia
+                                      items={items}
+                                      index={idx}
+                                      caption={ownedRestaurant.name}
+                                      showHint
+                                      community={{
+                                        restaurantId: ownedRestaurant.id,
+                                        supabase,
+                                        user,
+                                        notify: setNotice,
+                                      }}
+                                      className="absolute inset-0 w-full h-full"
+                                    >
+                                      <MediaPreview
+                                        item={items[idx]}
+                                        alt={m.label}
+                                        className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+                                      />
+                                    </ViewableMedia>
+                                  );
+                                })()
                               ) : (
                                 <span className="text-xs text-slate-600">
                                   No photo uploaded
@@ -3075,13 +4225,34 @@ export default function UKHalalAppMapbox() {
                               </div>
                               <div className="relative h-48 w-full overflow-hidden rounded-xl border border-slate-800 bg-slate-950 flex items-center justify-center">
                                 {rest.media?.[mediaTab] ? (
-                                  <img
-                                    src={rest.media[mediaTab]}
-                                    alt={`${rest.name} ${mediaTab
-                                      .replace('_', ' ')
-                                      .toLowerCase()}`}
-                                    className="w-full h-full object-cover"
-                                  />
+                                  (() => {
+                                    const { items, keys } = restaurantMediaItems(
+                                      rest.media
+                                    );
+                                    const idx = keys.indexOf(mediaTab);
+                                    if (idx < 0) return null;
+                                    return (
+                                      <ViewableMedia
+                                        items={items}
+                                        index={idx}
+                                        caption={rest.name}
+                                        showHint
+                                        community={{
+                                          restaurantId: rest.id,
+                                          supabase,
+                                          user,
+                                          notify: setNotice,
+                                        }}
+                                        className="absolute inset-0 w-full h-full"
+                                      >
+                                        <MediaPreview
+                                          item={items[idx]}
+                                          alt={`${rest.name} ${items[idx].label}`}
+                                          className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+                                        />
+                                      </ViewableMedia>
+                                    );
+                                  })()
                                 ) : (
                                   <div className="flex flex-col items-center justify-center text-slate-500 space-y-1">
                                     <ImageIcon className="w-6 h-6 opacity-40" />
@@ -3727,11 +4898,29 @@ export default function UKHalalAppMapbox() {
                   {editingPhotos.map((ph) =>
                     photoUrls[ph.path] ? (
                       <div key={ph.id} className="relative">
-                        <img
-                          src={photoUrls[ph.path]}
-                          alt="Your photo"
-                          className="w-16 h-16 object-cover rounded-lg border border-slate-700"
-                        />
+                        {(() => {
+                          const list = editingPhotos.filter(
+                            (x) => photoUrls[x.path]
+                          );
+                          const items: MediaItem[] = list.map((x) => ({
+                            src: photoUrls[x.path],
+                            type: 'image',
+                          }));
+                          return (
+                            <ViewableMedia
+                              items={items}
+                              index={list.findIndex((x) => x.id === ph.id)}
+                              caption="Your photo"
+                              className="block rounded-lg overflow-hidden border border-slate-700"
+                            >
+                              <img
+                                src={photoUrls[ph.path]}
+                                alt="Your photo"
+                                className="w-16 h-16 object-cover"
+                              />
+                            </ViewableMedia>
+                          );
+                        })()}
                         <button
                           type="button"
                           onClick={() => handleRemovePhoto(ph.id)}
@@ -4001,7 +5190,7 @@ export default function UKHalalAppMapbox() {
               {[
                 ...MEDIA_TABS.map((m) => ({
                   key: MEDIA_FORM_KEY[m.key] as string,
-                  label: `${m.label} Image URL:`,
+                  label: `${m.label} image or video link:`,
                 })),
                 {
                   key: 'certificateLink',
