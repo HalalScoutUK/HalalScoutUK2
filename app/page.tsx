@@ -8,6 +8,7 @@ import React, {
   useRef,
 } from 'react';
 import { createPortal } from 'react-dom';
+import * as tus from 'tus-js-client';
 import Map, { Marker, Popup, Source, Layer } from 'react-map-gl/mapbox';
 import 'mapbox-gl/dist/mapbox-gl.css';
 import { createClient } from '@/lib/supabase/client';
@@ -29,6 +30,8 @@ import {
   Play,
   Maximize2,
   Volume2,
+  Upload,
+  Trash2,
   VolumeX,
   Send,
   X,
@@ -61,14 +64,6 @@ const MEDIA_TABS: { key: MediaKey; label: string }[] = [
   { key: 'MENU', label: 'Menu' },
   { key: 'FOOD', label: 'Food' },
 ];
-
-// Which owner-form field holds the image link for each photo type
-const MEDIA_FORM_KEY: Record<MediaKey, 'shopFront' | 'interior' | 'menu' | 'food'> = {
-  SHOP_FRONT: 'shopFront',
-  INTERIOR: 'interior',
-  MENU: 'menu',
-  FOOD: 'food',
-};
 
 const LONDON = { latitude: 51.5074, longitude: -0.1278 };
 
@@ -1961,6 +1956,997 @@ function certificationStatus(r: any): {
   };
 }
 
+// ===========================================================================
+// Owner portal: a friendlier home for restaurant owners. Photos and videos are
+// uploaded straight from a phone or computer (no links to paste), with live
+// progress, a preview of how the listing will look, and a tip for each slot.
+// Photos go to Supabase Storage; videos go to Bunny through a small server
+// function, so the Bunny key never reaches the browser.
+// ===========================================================================
+
+const MEDIA_BUCKET = 'restaurant-media';
+const MAX_VIDEO_MB = 300;
+const MAX_VIDEO_SECONDS = 60;
+const BUNNY_TUS_ENDPOINT = 'https://video.bunnycdn.com/tusupload';
+
+const SLOT_GUIDE: Record<
+  MediaKey,
+  { emoji: string; accepts: 'both' | 'image'; tip: string }
+> = {
+  SHOP_FRONT: {
+    emoji: '🏪',
+    accepts: 'both',
+    tip: 'Stand across the street in daylight and get your sign and door in the shot. This is the first picture people see.',
+  },
+  INTERIOR: {
+    emoji: '🪑',
+    accepts: 'both',
+    tip: 'Show the seating and the atmosphere. A slow 15-second walk-through video works really well.',
+  },
+  MENU: {
+    emoji: '📋',
+    accepts: 'image',
+    tip: 'Lay the menu flat in good light so every line is easy to read. A clear photo beats a blurry one.',
+  },
+  FOOD: {
+    emoji: '🍛',
+    accepts: 'both',
+    tip: 'Shoot your best dish from above or at a slight angle in natural light. Or film it being served.',
+  },
+};
+
+type SlotPhase = 'idle' | 'uploading' | 'processing' | 'saving' | 'error';
+type SlotState = {
+  phase: SlotPhase;
+  progress: number;
+  kind?: 'image' | 'video';
+  localUrl?: string;
+  message?: string;
+};
+const IDLE_SLOT: SlotState = { phase: 'idle', progress: 0 };
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+function readVideoDuration(file: File): Promise<number | null> {
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement('video');
+    let finished = false;
+    const done = (d: number | null) => {
+      if (finished) return;
+      finished = true;
+      URL.revokeObjectURL(url);
+      resolve(d);
+    };
+    const timer = window.setTimeout(() => done(null), 4000);
+    v.preload = 'metadata';
+    v.onloadedmetadata = () => {
+      window.clearTimeout(timer);
+      done(Number.isFinite(v.duration) ? v.duration : null);
+    };
+    v.onerror = () => {
+      window.clearTimeout(timer);
+      done(null);
+    };
+    v.src = url;
+  });
+}
+
+function bunnyVideoIdFromUrl(url?: string | null) {
+  const m = url?.match(
+    /\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/play_\d+p\.mp4/i
+  );
+  return m ? m[1] : null;
+}
+
+function storagePathFromUrl(url?: string | null) {
+  if (!url) return null;
+  const marker = `/object/public/${MEDIA_BUCKET}/`;
+  const i = url.indexOf(marker);
+  if (i < 0) return null;
+  return decodeURIComponent(url.slice(i + marker.length).split('?')[0]);
+}
+
+function uploadErrorMessage(e: unknown): string {
+  const m = String((e as any)?.message ?? e ?? '');
+  if (m.includes('mp4_fallback_disabled'))
+    return "Your video uploaded, but MP4 files aren't switched on in the video library yet. Please contact support.";
+  if (m.includes('timeout'))
+    return 'This is taking longer than usual. Please check back in a few minutes and try again.';
+  if (m.includes('url_not_allowed'))
+    return "We couldn't save this file because its address isn't allowed yet. Please contact support.";
+  if (m.includes('menu_must_be_a_photo')) return 'Menus need to be a photo.';
+  if (/network|fetch|failed to send|offline/i.test(m))
+    return 'Your connection dropped. Please try again.';
+  return 'Something went wrong. Please try again.';
+}
+
+function ProgressRing({ percent, size = 72 }: { percent: number; size?: number }) {
+  const stroke = 6;
+  const r = (size - stroke) / 2;
+  const c = 2 * Math.PI * r;
+  const clamped = Math.min(100, Math.max(0, percent));
+  return (
+    <div className="relative" style={{ width: size, height: size }}>
+      <svg width={size} height={size} className="-rotate-90">
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={r}
+          stroke="currentColor"
+          strokeWidth={stroke}
+          fill="none"
+          className="text-slate-800"
+        />
+        <circle
+          cx={size / 2}
+          cy={size / 2}
+          r={r}
+          stroke="currentColor"
+          strokeWidth={stroke}
+          fill="none"
+          strokeLinecap="round"
+          strokeDasharray={c}
+          strokeDashoffset={c * (1 - clamped / 100)}
+          className="text-emerald-400 transition-all duration-500"
+        />
+      </svg>
+      <span className="absolute inset-0 flex items-center justify-center text-sm font-black text-white">
+        {Math.round(clamped)}%
+      </span>
+    </div>
+  );
+}
+
+// A phone-shaped preview of how the listing looks to customers
+function PhonePreview({
+  restaurant,
+  media,
+}: {
+  restaurant: any;
+  media: Record<string, string>;
+}) {
+  const [sel, setSel] = useState<MediaKey>(MEDIA_TABS[0].key);
+  const { items, keys } = restaurantMediaItems(media);
+  const idx = keys.indexOf(sel);
+  const status = certificationStatus(restaurant);
+  const badge =
+    status.state === 'lapsed'
+      ? { label: status.label, color: 'bg-amber-600 text-white' }
+      : getCategoryBadge(restaurant.halalCategory);
+
+  return (
+    <div className="mx-auto w-[270px] rounded-[2.4rem] border-4 border-slate-700 bg-slate-950 p-3 shadow-2xl">
+      <div className="mx-auto mb-3 h-1.5 w-16 rounded-full bg-slate-700" />
+      <div className="rounded-2xl bg-slate-900 border border-slate-800 p-3 space-y-2.5">
+        <div>
+          <p className="text-sm font-bold text-white truncate">{restaurant.name}</p>
+          <p className="text-[10px] text-slate-500">
+            {restaurant.city}, {restaurant.postcode}
+          </p>
+        </div>
+        <span
+          className={`inline-block text-[10px] font-bold px-2.5 py-0.5 rounded-lg ${badge.color}`}
+        >
+          {badge.label}
+        </span>
+        <div className="flex flex-wrap gap-1">
+          {MEDIA_TABS.map((t) => (
+            <button
+              key={t.key}
+              type="button"
+              onClick={() => setSel(t.key)}
+              className={`px-2 py-1 rounded-md text-[9px] font-semibold border transition ${
+                sel === t.key
+                  ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+                  : 'bg-slate-800 border-slate-700 text-slate-400'
+              }`}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+        <div className="relative h-40 rounded-xl overflow-hidden bg-slate-950 border border-slate-800 flex items-center justify-center">
+          {idx >= 0 ? (
+            <MediaPreview
+              item={items[idx]}
+              alt={`${restaurant.name} ${items[idx].label}`}
+              className="w-full h-full object-cover"
+            />
+          ) : (
+            <span className="text-[10px] text-slate-600">Nothing here yet</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OwnerPortal({
+  restaurant,
+  supabase,
+  user,
+  reviews,
+  team,
+  teamError,
+  photoUrls,
+  onMediaChange,
+  onCertLinkChange,
+  notify,
+  onViewListing,
+}: {
+  restaurant: any;
+  supabase: any;
+  user: any;
+  reviews: any[];
+  team: { user_id: string; username: string; is_you: boolean }[];
+  teamError: string;
+  photoUrls: Record<string, string>;
+  onMediaChange: (slot: MediaKey, url: string | null) => void;
+  onCertLinkChange: (link: string) => void;
+  notify: (message: string) => void;
+  onViewListing: () => void;
+}) {
+  const [tab, setTab] = useState<'MEDIA' | 'OVERVIEW' | 'REVIEWS' | 'TEAM'>('MEDIA');
+  const [slots, setSlots] = useState<Record<string, SlotState>>({});
+  const [dragSlot, setDragSlot] = useState<MediaKey | null>(null);
+  const [stats, setStats] = useState<Record<string, { likes: number; comments: number }>>({});
+  const [certInput, setCertInput] = useState<string>(restaurant.certificateLink || '');
+  const [savingCert, setSavingCert] = useState(false);
+
+  const fileInputs = useRef<Record<string, HTMLInputElement | null>>({});
+  const cancelled = useRef<Record<string, boolean>>({});
+  const cancelHandlers = useRef<Record<string, (() => void) | undefined>>({});
+  const pendingVideo = useRef<Record<string, string | null>>({});
+
+  const media: Record<string, string> = restaurant.media || {};
+  const status = certificationStatus(restaurant);
+  const { items: galleryItems, keys: galleryKeys } = restaurantMediaItems(media);
+  const filled = MEDIA_TABS.filter((m) => !!media[m.key]).length;
+  const percent = Math.round((filled / MEDIA_TABS.length) * 100);
+  const firstEmpty = MEDIA_TABS.find((m) => !media[m.key]);
+  const totalLikes = Object.values(stats).reduce((n, s) => n + s.likes, 0);
+  const totalComments = Object.values(stats).reduce((n, s) => n + s.comments, 0);
+  const community: VideoCommunity = {
+    restaurantId: restaurant.id,
+    supabase,
+    user,
+    notify,
+  };
+
+  // Likes and comments on this restaurant's videos
+  const mediaFingerprint = MEDIA_TABS.map((m) => media[m.key] || '').join('|');
+  useEffect(() => {
+    let live = true;
+    supabase
+      .rpc('get_video_stats', { p_restaurant_id: restaurant.id })
+      .then(({ data }: { data: any[] | null }) => {
+        if (!live || !data) return;
+        const map: Record<string, { likes: number; comments: number }> = {};
+        data.forEach((row) => {
+          map[row.media_key] = {
+            likes: Number(row.like_count || 0),
+            comments: Number(row.comment_count || 0),
+          };
+        });
+        setStats(map);
+      });
+    return () => {
+      live = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [restaurant.id, mediaFingerprint]);
+
+  const setSlot = (slot: MediaKey, patch: Partial<SlotState>) =>
+    setSlots((prev) => ({ ...prev, [slot]: { ...(prev[slot] ?? IDLE_SLOT), ...patch } }));
+  const resetSlot = (slot: MediaKey) =>
+    setSlots((prev) => ({ ...prev, [slot]: IDLE_SLOT }));
+
+  // Best-effort clean-up of the file a new upload replaces
+  const cleanupOld = async (oldUrl?: string | null) => {
+    if (!oldUrl) return;
+    try {
+      const videoId = bunnyVideoIdFromUrl(oldUrl);
+      if (videoId) {
+        await supabase.functions.invoke('bunny-media', {
+          body: { action: 'delete', restaurantId: restaurant.id, videoId },
+        });
+        return;
+      }
+      const path = storagePathFromUrl(oldUrl);
+      if (path) await supabase.storage.from(MEDIA_BUCKET).remove([path]);
+    } catch {
+      /* the old file stays behind; nothing the owner needs to know */
+    }
+  };
+
+  const uploadImage = async (slot: MediaKey, file: File): Promise<string> => {
+    // Menus need to stay readable, so they keep more detail
+    const blob =
+      slot === 'MENU'
+        ? await resizeImage(file, 2200, 0.88)
+        : await resizeImage(file);
+    const path = `${restaurant.id}/${slot.toLowerCase()}-${crypto.randomUUID()}.jpg`;
+    setSlot(slot, { progress: 40 });
+    const { error } = await supabase.storage
+      .from(MEDIA_BUCKET)
+      .upload(path, blob, {
+        contentType: 'image/jpeg',
+        upsert: false,
+        cacheControl: '31536000',
+      });
+    if (error) throw error;
+    setSlot(slot, { progress: 90 });
+    return supabase.storage.from(MEDIA_BUCKET).getPublicUrl(path).data.publicUrl as string;
+  };
+
+  const uploadVideo = async (slot: MediaKey, file: File): Promise<string> => {
+    const { data: creds, error: credErr } = await supabase.functions.invoke('bunny-media', {
+      body: { action: 'create-upload', restaurantId: restaurant.id, slot },
+    });
+    if (credErr || !creds || creds.error) {
+      throw new Error(creds?.error ?? credErr?.message ?? 'upload_setup_failed');
+    }
+    const videoId: string = creds.videoId;
+    pendingVideo.current[slot] = videoId;
+
+    await new Promise<void>((resolve, reject) => {
+      const upload = new tus.Upload(file, {
+        endpoint: BUNNY_TUS_ENDPOINT,
+        retryDelays: [0, 3000, 5000, 10000, 20000, 60000],
+        headers: {
+          AuthorizationSignature: String(creds.signature),
+          AuthorizationExpire: String(creds.expirationTime),
+          VideoId: videoId,
+          LibraryId: String(creds.libraryId),
+        },
+        metadata: { filetype: file.type, title: `r${restaurant.id}:${slot}` },
+        onError: (err) => reject(err),
+        onProgress: (sent, total) =>
+          setSlot(slot, { progress: total ? Math.round((sent / total) * 100) : 0 }),
+        onSuccess: () => resolve(),
+      });
+      cancelHandlers.current[slot] = () => {
+        upload.abort(true);
+        reject(new Error('cancelled'));
+      };
+      upload.start();
+    });
+    cancelHandlers.current[slot] = undefined;
+
+    // Bunny now prepares the video; wait until its MP4 is ready
+    setSlot(slot, { phase: 'processing', progress: 0 });
+    const started = Date.now();
+    for (;;) {
+      await sleep(3000);
+      if (cancelled.current[slot]) throw new Error('cancelled');
+      const { data: st, error: stErr } = await supabase.functions.invoke('bunny-media', {
+        body: { action: 'status', restaurantId: restaurant.id, videoId },
+      });
+      if (stErr || !st) throw new Error(stErr?.message ?? 'status_failed');
+      if (st.error) throw new Error(st.error);
+      setSlot(slot, { phase: 'processing', progress: Number(st.progress ?? 0) });
+      if (st.ready && st.url) {
+        pendingVideo.current[slot] = null;
+        return st.url as string;
+      }
+      if (Date.now() - started > 10 * 60 * 1000) throw new Error('timeout');
+    }
+  };
+
+  const handleFile = async (slot: MediaKey, file: File) => {
+    const guide = SLOT_GUIDE[slot];
+    const isImage = ALLOWED_PHOTO_TYPES.includes(file.type);
+    const isVideo = file.type.startsWith('video/');
+    const fail = (message: string) =>
+      setSlot(slot, { phase: 'error', progress: 0, message, localUrl: undefined });
+
+    if (!isImage && !isVideo) {
+      fail(
+        guide.accepts === 'both'
+          ? 'Please choose a photo (JPEG, PNG or WebP) or a video.'
+          : 'Please choose a photo (JPEG, PNG or WebP).'
+      );
+      return;
+    }
+    if (isVideo && guide.accepts === 'image') {
+      fail('Menus need to be a photo, so everything stays readable.');
+      return;
+    }
+    if (isImage && file.size > 25 * 1024 * 1024) {
+      fail('That photo is very large. Please choose one under 25 MB.');
+      return;
+    }
+    if (isVideo && file.size > MAX_VIDEO_MB * 1024 * 1024) {
+      fail(`That video is too large. Please keep it under ${MAX_VIDEO_MB} MB.`);
+      return;
+    }
+    if (isVideo) {
+      const seconds = await readVideoDuration(file);
+      if (seconds !== null && seconds > MAX_VIDEO_SECONDS + 1) {
+        fail(
+          `Please keep videos under ${MAX_VIDEO_SECONDS} seconds. The first 5 seconds are what people see first.`
+        );
+        return;
+      }
+    }
+
+    const previous = media[slot];
+    const localUrl = URL.createObjectURL(file);
+    cancelled.current[slot] = false;
+    setSlot(slot, {
+      phase: 'uploading',
+      progress: 0,
+      kind: isVideo ? 'video' : 'image',
+      localUrl,
+      message: undefined,
+    });
+
+    try {
+      const newUrl = isVideo ? await uploadVideo(slot, file) : await uploadImage(slot, file);
+      if (cancelled.current[slot]) return;
+      setSlot(slot, { phase: 'saving', progress: 100 });
+      const { error } = await supabase.rpc('set_restaurant_media', {
+        p_restaurant_id: restaurant.id,
+        p_slot: slot,
+        p_url: newUrl,
+      });
+      if (error) throw error;
+      onMediaChange(slot, newUrl);
+      notify(`${MEDIA_TABS.find((m) => m.key === slot)?.label ?? 'Media'} updated.`);
+      resetSlot(slot);
+      void cleanupOld(previous);
+    } catch (e) {
+      if (cancelled.current[slot]) resetSlot(slot);
+      else fail(uploadErrorMessage(e));
+    } finally {
+      URL.revokeObjectURL(localUrl);
+    }
+  };
+
+  const cancelUpload = (slot: MediaKey) => {
+    cancelled.current[slot] = true;
+    cancelHandlers.current[slot]?.();
+    const pending = pendingVideo.current[slot];
+    if (pending) {
+      pendingVideo.current[slot] = null;
+      void supabase.functions.invoke('bunny-media', {
+        body: { action: 'delete', restaurantId: restaurant.id, videoId: pending },
+      });
+    }
+    resetSlot(slot);
+  };
+
+  const removeSlot = async (m: { key: MediaKey; label: string }) => {
+    const idx = galleryKeys.indexOf(m.key);
+    const kind = idx >= 0 && galleryItems[idx].type === 'video' ? 'video' : 'photo';
+    if (!window.confirm(`Remove your ${m.label.toLowerCase()} ${kind}?`)) return;
+    const previous = media[m.key];
+    const { error } = await supabase.rpc('clear_restaurant_media', {
+      p_restaurant_id: restaurant.id,
+      p_slot: m.key,
+    });
+    if (error) {
+      notify('Could not remove it. Please try again.');
+      return;
+    }
+    onMediaChange(m.key, null);
+    notify(`${m.label} removed.`);
+    void cleanupOld(previous);
+  };
+
+  const saveCertLink = async () => {
+    const link = certInput.trim();
+    if (link && !/^https?:\/\//i.test(link)) {
+      notify('Please enter a full web address starting with https://');
+      return;
+    }
+    setSavingCert(true);
+    const { error } = await supabase
+      .from('restaurants')
+      .update({ certificate_link: link || null })
+      .eq('id', restaurant.id);
+    setSavingCert(false);
+    if (error) {
+      notify('Could not save the link: ' + error.message);
+      return;
+    }
+    onCertLinkChange(link);
+    notify('Certificate link saved.');
+  };
+
+  /* ----------------------------- one upload card ----------------------------- */
+
+  const renderSlot = (m: { key: MediaKey; label: string }) => {
+    const guide = SLOT_GUIDE[m.key];
+    const url: string | undefined = media[m.key];
+    const st = slots[m.key] ?? IDLE_SLOT;
+    const busy =
+      st.phase === 'uploading' || st.phase === 'processing' || st.phase === 'saving';
+    const idx = galleryKeys.indexOf(m.key);
+    const isVideoSlot = idx >= 0 && galleryItems[idx].type === 'video';
+    const stat = stats[m.key];
+    const accept =
+      guide.accepts === 'both'
+        ? 'image/jpeg,image/png,image/webp,video/*'
+        : 'image/jpeg,image/png,image/webp';
+    const pickFile = () => fileInputs.current[m.key]?.click();
+
+    return (
+      <div
+        key={m.key}
+        className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl flex flex-col"
+      >
+        <div className="flex items-center justify-between px-4 pt-3">
+          <span className="flex items-center gap-2 text-sm font-bold text-white">
+            <span className="text-lg">{guide.emoji}</span>
+            {m.label}
+            {url && !busy && <CheckCircle2 className="w-4 h-4 text-emerald-400" />}
+          </span>
+          <span className="text-[10px] font-semibold text-slate-400 bg-slate-800 border border-slate-700 rounded-full px-2 py-0.5">
+            {guide.accepts === 'both' ? 'Photo or video' : 'Photo'}
+          </span>
+        </div>
+
+        <div className="p-3">
+          <div
+            className={`relative aspect-[4/3] w-full rounded-xl overflow-hidden border-2 transition ${
+              dragSlot === m.key
+                ? 'border-emerald-400 bg-emerald-500/10'
+                : url || busy
+                ? 'border-slate-800 bg-slate-950'
+                : 'border-dashed border-slate-700 bg-slate-950 hover:border-emerald-500/60'
+            }`}
+            onDragOver={(e) => {
+              e.preventDefault();
+              if (!busy) setDragSlot(m.key);
+            }}
+            onDragLeave={() => setDragSlot(null)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragSlot(null);
+              const f = e.dataTransfer.files?.[0];
+              if (f && !busy) handleFile(m.key, f);
+            }}
+          >
+            <input
+              ref={(el) => {
+                fileInputs.current[m.key] = el;
+              }}
+              type="file"
+              accept={accept}
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                e.target.value = '';
+                if (f) handleFile(m.key, f);
+              }}
+            />
+
+            {busy ? (
+              <>
+                {st.localUrl &&
+                  (st.kind === 'video' ? (
+                    <video
+                      src={st.localUrl}
+                      muted
+                      playsInline
+                      className="absolute inset-0 w-full h-full object-cover opacity-30"
+                    />
+                  ) : (
+                    <img
+                      src={st.localUrl}
+                      alt=""
+                      className="absolute inset-0 w-full h-full object-cover opacity-30"
+                    />
+                  ))}
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-4">
+                  {st.phase === 'processing' ? (
+                    <div className="w-14 h-14 rounded-full border-4 border-slate-700 border-t-emerald-400 animate-spin" />
+                  ) : (
+                    <ProgressRing percent={st.progress} />
+                  )}
+                  <p className="text-xs font-bold text-white">
+                    {st.phase === 'uploading'
+                      ? st.kind === 'video'
+                        ? 'Uploading your video...'
+                        : 'Uploading your photo...'
+                      : st.phase === 'processing'
+                      ? `Getting your video ready${st.progress ? ` (${st.progress}%)` : '...'}`
+                      : 'Saving...'}
+                  </p>
+                  {st.phase === 'processing' && (
+                    <p className="text-[10px] text-slate-300">
+                      Keep this page open. It usually takes about a minute.
+                    </p>
+                  )}
+                  {st.phase === 'uploading' && st.kind === 'video' && (
+                    <button
+                      type="button"
+                      onClick={() => cancelUpload(m.key)}
+                      className="text-[11px] font-semibold text-slate-300 hover:text-white underline"
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
+              </>
+            ) : url && galleryKeys.indexOf(m.key) >= 0 ? (
+              <>
+                <ViewableMedia
+                  items={galleryItems}
+                  index={galleryKeys.indexOf(m.key)}
+                  caption={restaurant.name}
+                  showHint
+                  community={community}
+                  className="absolute inset-0 w-full h-full"
+                >
+                  <MediaPreview
+                    item={galleryItems[galleryKeys.indexOf(m.key)]}
+                    alt={`${restaurant.name} ${m.label}`}
+                    className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+                  />
+                </ViewableMedia>
+                <div className="absolute inset-x-0 bottom-0 flex items-center justify-end gap-2 p-2 bg-gradient-to-t from-black/70 to-transparent pointer-events-none">
+                  <button
+                    type="button"
+                    onClick={pickFile}
+                    className="pointer-events-auto flex items-center gap-1.5 bg-slate-900/80 hover:bg-slate-800 border border-slate-600 text-white text-[11px] font-semibold px-3 py-1.5 rounded-lg backdrop-blur"
+                  >
+                    <Upload className="w-3 h-3" /> Replace
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => removeSlot(m)}
+                    aria-label={`Remove ${m.label}`}
+                    className="pointer-events-auto bg-slate-900/80 hover:bg-rose-900/70 border border-slate-600 text-slate-200 p-1.5 rounded-lg backdrop-blur"
+                  >
+                    <Trash2 className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </>
+            ) : (
+              <button
+                type="button"
+                onClick={pickFile}
+                className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-center px-4 group"
+              >
+                <span className="w-12 h-12 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400 group-hover:scale-110 transition">
+                  <Upload className="w-5 h-5" />
+                </span>
+                <span className="text-xs font-bold text-white">
+                  {dragSlot === m.key
+                    ? 'Drop it here'
+                    : guide.accepts === 'both'
+                    ? 'Add a photo or video'
+                    : 'Add a photo'}
+                </span>
+                <span className="text-[10px] text-slate-500">
+                  Tap to choose, or drag a file here
+                </span>
+              </button>
+            )}
+          </div>
+
+          {st.phase === 'error' && st.message && (
+            <div className="mt-2 bg-rose-950/40 border border-rose-500/40 text-rose-300 text-[11px] p-2.5 rounded-lg flex items-start justify-between gap-2">
+              <span>{st.message}</span>
+              <button
+                type="button"
+                onClick={pickFile}
+                className="shrink-0 font-bold underline"
+              >
+                Try again
+              </button>
+            </div>
+          )}
+
+          <p className="mt-2 text-[11px] leading-relaxed text-slate-400">{guide.tip}</p>
+
+          {isVideoSlot && url && !busy && (
+            <div className="mt-2 flex items-center gap-3 text-[11px] font-semibold text-slate-300">
+              <span className="flex items-center gap-1">
+                <Heart className="w-3.5 h-3.5 text-rose-400" /> {stat?.likes ?? 0}
+              </span>
+              <span className="flex items-center gap-1">
+                <MessageSquare className="w-3.5 h-3.5 text-sky-400" /> {stat?.comments ?? 0}
+              </span>
+              <span className="text-slate-500 font-normal">on this video</span>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  /* ----------------------------------- page ----------------------------------- */
+
+  const statusChip =
+    status.state === 'lapsed'
+      ? 'bg-amber-400/15 text-amber-300 border-amber-400/40'
+      : status.state === 'options'
+      ? 'bg-sky-500/15 text-sky-300 border-sky-500/40'
+      : 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40';
+
+  const tabs: { id: 'MEDIA' | 'OVERVIEW' | 'REVIEWS' | 'TEAM'; label: string; count?: number }[] = [
+    { id: 'MEDIA', label: 'Photos & videos', count: filled },
+    { id: 'OVERVIEW', label: 'Overview' },
+    { id: 'REVIEWS', label: 'Reviews', count: restaurant.reviewCount || 0 },
+    { id: 'TEAM', label: 'Team', count: team.length },
+  ];
+
+  return (
+    <div className="space-y-6">
+      {/* Hero */}
+      <div className="relative overflow-hidden rounded-3xl border border-amber-500/30 bg-gradient-to-br from-amber-500/15 via-slate-900 to-slate-900 p-5 sm:p-6 shadow-2xl">
+        <div className="absolute -right-12 -top-12 h-44 w-44 rounded-full bg-amber-400/10 blur-3xl pointer-events-none" />
+        <div className="relative flex flex-wrap items-center justify-between gap-5">
+          <div className="space-y-2 min-w-0">
+            <span className="inline-block bg-amber-400 text-slate-950 text-[10px] font-black px-2 py-0.5 rounded uppercase">
+              Owner portal
+            </span>
+            <h1 className="text-2xl sm:text-3xl font-black text-white break-words">
+              {restaurant.name}
+            </h1>
+            <p className="text-xs text-slate-400">
+              {restaurant.city}, {restaurant.postcode}
+            </p>
+            <div className="flex flex-wrap items-center gap-2 pt-1">
+              <span className={`text-[11px] font-bold px-2.5 py-1 rounded-full border ${statusChip}`}>
+                {status.label}
+              </span>
+              <span className="flex items-center gap-1 text-[11px] font-bold text-amber-300 bg-slate-950/60 border border-slate-800 px-2.5 py-1 rounded-full">
+                <Star className="w-3 h-3 fill-current" />
+                {restaurant.avgRating || 'New'}
+                <span className="text-slate-500 font-medium">
+                  ({restaurant.reviewCount || 0})
+                </span>
+              </span>
+              {(totalLikes > 0 || totalComments > 0) && (
+                <span className="flex items-center gap-2 text-[11px] font-bold text-slate-200 bg-slate-950/60 border border-slate-800 px-2.5 py-1 rounded-full">
+                  <Heart className="w-3 h-3 text-rose-400" /> {totalLikes}
+                  <MessageSquare className="w-3 h-3 text-sky-400" /> {totalComments}
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div className="flex items-center gap-5">
+            <div className="flex items-center gap-3">
+              <ProgressRing percent={percent} size={64} />
+              <div>
+                <p className="text-sm font-bold text-white">{filled} of 4 ready</p>
+                <p className="text-[11px] text-slate-400 max-w-[150px]">
+                  {firstEmpty
+                    ? `Next up: your ${firstEmpty.label.toLowerCase()}`
+                    : 'Your listing looks complete'}
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={onViewListing}
+              className="flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold px-4 py-2.5 rounded-xl border border-slate-700 transition shadow"
+            >
+              <Globe className="w-4 h-4 text-emerald-400" /> See my listing
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {filled === MEDIA_TABS.length && (
+        <div className="lb-pop bg-emerald-500/10 border border-emerald-500/40 text-emerald-300 text-xs font-semibold rounded-2xl px-4 py-3 flex items-center gap-2">
+          <Trophy className="w-4 h-4" /> Nice work. Every photo slot is filled, so your
+          listing is looking its best.
+        </div>
+      )}
+
+      {/* Tabs */}
+      <div className="flex gap-1 bg-slate-900 border border-slate-800 rounded-2xl p-1 overflow-x-auto">
+        {tabs.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setTab(t.id)}
+            className={`shrink-0 flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold transition ${
+              tab === t.id
+                ? 'bg-amber-400 text-slate-950 shadow'
+                : 'text-slate-300 hover:text-white'
+            }`}
+          >
+            {t.label}
+            {t.count !== undefined && (
+              <span
+                className={`text-[10px] font-mono ${
+                  tab === t.id ? 'text-slate-800' : 'text-slate-500'
+                }`}
+              >
+                {t.count}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* Photos & videos */}
+      {tab === 'MEDIA' && (
+        <div className="grid gap-6 lg:grid-cols-[1fr_300px] items-start">
+          <div className="space-y-4">
+            <div className="rounded-2xl border border-slate-800 bg-slate-900/60 p-4 flex items-start gap-3">
+              <span className="w-9 h-9 shrink-0 rounded-full bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+                <Play className="w-4 h-4 fill-current" />
+              </span>
+              <div className="space-y-1">
+                <p className="text-sm font-bold text-white">Tips for great videos</p>
+                <p className="text-[11px] leading-relaxed text-slate-400">
+                  Film upright on your phone, for 15 to 30 seconds (60 at most).
+                  On your listing, the <strong className="text-slate-200">first 5 seconds
+                  play on a silent loop</strong>, so open with your best moment.
+                  Tapping it opens the full video with sound, and customers can like
+                  and comment.
+                </p>
+              </div>
+            </div>
+            <div className="grid gap-4 sm:grid-cols-2">{MEDIA_TABS.map(renderSlot)}</div>
+          </div>
+
+          <div className="space-y-3 lg:sticky lg:top-24">
+            <p className="text-center text-xs font-bold uppercase tracking-wider text-slate-400">
+              How it looks to customers
+            </p>
+            <PhonePreview restaurant={restaurant} media={media} />
+            <p className="text-center text-[11px] text-slate-500">
+              Tap the tabs to look around. It updates as you upload.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Overview */}
+      {tab === 'OVERVIEW' && (
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-2 shadow-xl">
+            <p className="text-xs font-semibold text-slate-400 flex items-center gap-1.5">
+              <ShieldCheck className="w-4 h-4 text-emerald-400" /> Halal certification
+            </p>
+            <p className={`text-base font-black ${status.state === 'lapsed' ? 'text-amber-300' : 'text-white'}`}>
+              {status.label}
+            </p>
+            {restaurant.certificateIssuer && (
+              <p className="text-xs text-emerald-400 font-semibold">{restaurant.certificateIssuer}</p>
+            )}
+            {status.ownerDetail && (
+              <p className="text-[11px] text-slate-400">{status.ownerDetail}</p>
+            )}
+            {status.hiddenFromPublic && (
+              <p className="text-[11px] font-semibold text-rose-400">
+                Hidden from the public until you upload a certificate.
+              </p>
+            )}
+          </div>
+
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-2 shadow-xl">
+            <p className="text-xs font-semibold text-slate-400 flex items-center gap-1.5">
+              <Globe className="w-4 h-4 text-sky-400" /> Certificate link
+            </p>
+            <p className="text-[11px] text-slate-500">
+              Where customers can check your certificate online.
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="url"
+                value={certInput}
+                onChange={(e) => setCertInput(e.target.value)}
+                placeholder="https://..."
+                className="flex-1 min-w-0 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:border-emerald-500"
+              />
+              <button
+                type="button"
+                onClick={saveCertLink}
+                disabled={savingCert}
+                className="bg-amber-400 hover:bg-amber-300 text-slate-950 text-xs font-bold px-4 rounded-lg disabled:opacity-50"
+              >
+                {savingCert ? 'Saving...' : 'Save'}
+              </button>
+            </div>
+          </div>
+
+          <div className="sm:col-span-2 grid grid-cols-2 sm:grid-cols-4 gap-3">
+            {[
+              { label: 'Rating', value: restaurant.avgRating || 'New', icon: <Star className="w-4 h-4 text-amber-400 fill-current" /> },
+              { label: 'Reviews', value: restaurant.reviewCount || 0, icon: <MessageSquare className="w-4 h-4 text-emerald-400" /> },
+              { label: 'Video likes', value: totalLikes, icon: <Heart className="w-4 h-4 text-rose-400" /> },
+              { label: 'Video comments', value: totalComments, icon: <MessageSquare className="w-4 h-4 text-sky-400" /> },
+            ].map((s) => (
+              <div key={s.label} className="bg-slate-900 border border-slate-800 rounded-2xl p-4 shadow-xl">
+                <p className="text-[11px] text-slate-400 flex items-center gap-1.5">
+                  {s.icon} {s.label}
+                </p>
+                <p className="text-2xl font-black text-white mt-1">{s.value}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Reviews */}
+      {tab === 'REVIEWS' && (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3 shadow-xl">
+          <h3 className="text-sm font-bold text-white flex items-center gap-2">
+            <MessageSquare className="w-4 h-4 text-emerald-400" /> What customers are saying
+          </h3>
+          {reviews.length > 0 ? (
+            <div className="space-y-3">
+              {reviews.map((rev: any) => (
+                <div
+                  key={rev.id}
+                  className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-xs text-white">@{rev.username}</span>
+                    <span className="flex items-center gap-1.5 text-amber-300 text-xs font-bold">
+                      <StarDisplay value={Number(rev.rating)} />
+                      {Number(rev.rating).toFixed(1)}
+                    </span>
+                  </div>
+                  {rev.comment && (
+                    <p className="text-xs text-slate-300 whitespace-pre-wrap break-words">
+                      {rev.comment}
+                    </p>
+                  )}
+                  <ReviewPhotoStrip
+                    photos={rev.photos}
+                    urls={photoUrls}
+                    caption={`Photo by @${rev.username}`}
+                  />
+                  <p className="text-[10px] text-slate-500 flex items-center gap-1">
+                    <ThumbsUp className="w-3 h-3" /> {Number(rev.like_count || 0)} thumbs up
+                  </p>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-slate-500 text-center py-6">
+              No reviews yet. Great photos and videos help people try you.
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Team */}
+      {tab === 'TEAM' && (
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-3 shadow-xl">
+          <h3 className="text-sm font-bold text-white flex items-center gap-2">
+            <UserCheck className="w-4 h-4 text-amber-400" /> People with access ({team.length})
+          </h3>
+          <p className="text-xs text-slate-400">
+            Everyone listed here can change this shop&apos;s photos and videos.
+          </p>
+          {teamError ? (
+            <p className="text-xs text-rose-400">{teamError}</p>
+          ) : (
+            <ul className="space-y-1.5">
+              {team.map((t) => (
+                <li
+                  key={t.user_id}
+                  className="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs"
+                >
+                  <span className="font-semibold text-white">@{t.username}</span>
+                  {t.is_you && (
+                    <span className="text-[10px] font-bold text-amber-300 bg-amber-400/20 border border-amber-400/40 px-2 py-0.5 rounded">
+                      You
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* Component                                                          */
 /* ------------------------------------------------------------------ */
@@ -2031,7 +3017,6 @@ export default function UKHalalAppMapbox() {
   const [showProfileModal, setShowProfileModal] = useState(false);
   const [showClaimModal, setShowClaimModal] = useState(false);
   const [showCertModal, setShowCertModal] = useState(false);
-  const [showOwnerModal, setShowOwnerModal] = useState(false);
 
   const [desiredUsername, setDesiredUsername] = useState('');
   const [usernameError, setUsernameError] = useState('');
@@ -2042,7 +3027,6 @@ export default function UKHalalAppMapbox() {
   const [claimCodeInput, setClaimCodeInput] = useState('');
   const [claimError, setClaimError] = useState('');
   const [claiming, setClaiming] = useState(false);
-  const [saving, setSaving] = useState(false);
   const [team, setTeam] = useState<
     { user_id: string; username: string; is_you: boolean }[]
   >([]);
@@ -2051,14 +3035,6 @@ export default function UKHalalAppMapbox() {
   const [notice, setNotice] = useState('');
 
   const isVerifiedOwner = ownedRestaurantIds.length > 0;
-
-  const [editForm, setEditForm] = useState({
-    shopFront: '',
-    interior: '',
-    food: '',
-    menu: '',
-    certificateLink: '',
-  });
 
   /* ------------------------- Notices ------------------------- */
 
@@ -2817,19 +3793,6 @@ export default function UKHalalAppMapbox() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [ownedRestaurant?.id, role]);
 
-  // Prefill the owner edit form from the owner's own restaurant
-  useEffect(() => {
-    if (ownedRestaurant) {
-      setEditForm({
-        shopFront: ownedRestaurant.media?.SHOP_FRONT || '',
-        interior: ownedRestaurant.media?.INTERIOR || '',
-        food: ownedRestaurant.media?.FOOD || '',
-        menu: ownedRestaurant.media?.MENU || '',
-        certificateLink: ownedRestaurant.certificateLink || '',
-      });
-    }
-  }, [ownedRestaurant?.id, showOwnerModal]);
-
   /* ------------------------- Location & search ------------------------- */
 
   function handleResetToCurrentLocation() {
@@ -3072,39 +4035,35 @@ export default function UKHalalAppMapbox() {
     );
   };
 
-  const handleSaveOwnerChanges = async () => {
-    if (!ownedRestaurant || !user) return;
-    setSaving(true);
+  // The owner portal tells us when a photo or video changed
+  const handleMediaChange = (slot: MediaKey, url: string | null) => {
+    if (!ownedRestaurant) return;
+    setRestaurants((prev) =>
+      prev.map((r) => {
+        if (r.id !== ownedRestaurant.id) return r;
+        const next: Record<string, string> = { ...(r.media || {}) };
+        if (url) next[slot] = url;
+        else delete next[slot];
+        return { ...r, media: next };
+      })
+    );
+  };
 
-    const media = {
-      ...(ownedRestaurant.media || {}),
-      SHOP_FRONT: editForm.shopFront.trim(),
-      INTERIOR: editForm.interior.trim(),
-      FOOD: editForm.food.trim(),
-      MENU: editForm.menu.trim(),
-    };
-    const certificateLink = editForm.certificateLink.trim();
-
-    // Row Level Security must restrict this to users in restaurant_owners.
-    const { error } = await supabase
-      .from('restaurants')
-      .update({ certificate_link: certificateLink, media })
-      .eq('id', ownedRestaurant.id);
-
-    setSaving(false);
-
-    if (error) {
-      setNotice('Failed to update restaurant profile: ' + error.message);
-      return;
-    }
-
+  const handleCertLinkChange = (link: string) => {
+    if (!ownedRestaurant) return;
     setRestaurants((prev) =>
       prev.map((r) =>
-        r.id === ownedRestaurant.id ? { ...r, certificateLink, media } : r
+        r.id === ownedRestaurant.id ? { ...r, certificateLink: link } : r
       )
     );
-    setShowOwnerModal(false);
-    setNotice('Restaurant details saved.');
+  };
+
+  const viewMyListing = () => {
+    if (!ownedRestaurant) return;
+    setRole('USER');
+    setPage('HOME');
+    setActiveRestaurantId(ownedRestaurant.id);
+    moveTo(ownedRestaurant.lat, ownedRestaurant.lng, 15);
   };
 
   /* ------------------------- Render ------------------------- */
@@ -3560,243 +4519,19 @@ export default function UKHalalAppMapbox() {
                 </button>
               </div>
             ) : (
-              (() => {
-                const avgRating = ownedRestaurant.avgRating;
-                return (
-                  <div className="space-y-6">
-                    {/* Header banner */}
-                    <div className="bg-gradient-to-r from-amber-500/10 via-slate-900 to-slate-900 border border-amber-500/30 rounded-2xl p-6 shadow-2xl flex flex-wrap items-center justify-between gap-4">
-                      <div className="space-y-1">
-                        <span className="bg-amber-400 text-slate-950 text-[10px] font-black px-2 py-0.5 rounded uppercase">
-                          Verified Owner Portal
-                        </span>
-                        <h1 className="text-2xl font-black text-white">
-                          {ownedRestaurant.name}
-                        </h1>
-                        <p className="text-xs text-slate-400">
-                          {ownedRestaurant.city}, {ownedRestaurant.postcode} •{' '}
-                          {ownedRestaurant.phone || 'No phone listed'}
-                        </p>
-                      </div>
-
-                      <button
-                        onClick={() => setShowOwnerModal(true)}
-                        className="bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold px-4 py-2.5 rounded-xl text-xs transition shadow flex items-center gap-2"
-                      >
-                        <Store className="w-4 h-4" /> Edit Profile & Photos
-                      </button>
-                    </div>
-
-                    {/* Metrics */}
-                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-1 shadow-xl">
-                        <p className="text-xs font-semibold text-slate-400">
-                          Live Community Rating
-                        </p>
-                        <div className="flex items-center gap-2">
-                          <span className="text-2xl font-black text-white">
-                            {avgRating || 'New'}
-                          </span>
-                          {avgRating && (
-                            <Star className="w-5 h-5 text-amber-400 fill-amber-400" />
-                          )}
-                        </div>
-                        <p className="text-[11px] text-slate-500">
-                          Based on verified user feedback
-                        </p>
-                      </div>
-
-                      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-1 shadow-xl">
-                        <p className="text-xs font-semibold text-slate-400">
-                          Total User Reviews
-                        </p>
-                        <p className="text-2xl font-black text-white">
-                          {ownedRestaurant.reviewCount || 0}
-                        </p>
-                        <p className="text-[11px] text-slate-500">
-                          Customer feedback history
-                        </p>
-                      </div>
-
-                      <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-1 shadow-xl">
-                        <p className="text-xs font-semibold text-slate-400">
-                          Halal Certification
-                        </p>
-                        <p className="text-sm font-bold text-emerald-400 truncate pt-1">
-                          {ownedRestaurant.certificateIssuer}
-                        </p>
-                        {(() => {
-                          const st = certificationStatus(ownedRestaurant);
-                          return (
-                            <>
-                              <p
-                                className={`text-xs font-semibold ${
-                                  st.state === 'lapsed'
-                                    ? 'text-amber-300'
-                                    : 'text-slate-200'
-                                }`}
-                              >
-                                {st.label}
-                              </p>
-                              {st.ownerDetail && (
-                                <p className="text-[11px] text-slate-400">
-                                  {st.ownerDetail}
-                                </p>
-                              )}
-                              {st.hiddenFromPublic && (
-                                <p className="text-[11px] font-semibold text-rose-400">
-                                  Hidden from the public until you upload a
-                                  certificate.
-                                </p>
-                              )}
-                            </>
-                          );
-                        })()}
-                        <a
-                          href={
-                            ownedRestaurant.certificateLink ||
-                            ownedRestaurant.website ||
-                            'https://halalhmc.org/outlets/'
-                          }
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-[11px] text-sky-400 hover:underline inline-flex items-center gap-1 pt-0.5"
-                        >
-                          View Official Registry ↗
-                        </a>
-                      </div>
-                    </div>
-
-                    {/* People with access */}
-                    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-3 shadow-2xl">
-                      <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                        <UserCheck className="w-4 h-4 text-amber-400" /> People
-                        with access ({team.length})
-                      </h3>
-                      <p className="text-xs text-slate-400">
-                        Everyone listed here can edit this shop&apos;s profile and
-                        photos.
-                      </p>
-                      {teamError ? (
-                        <p className="text-xs text-rose-400">{teamError}</p>
-                      ) : (
-                        <ul className="space-y-1.5">
-                          {team.map((m) => (
-                            <li
-                              key={m.user_id}
-                              className="flex items-center justify-between bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs"
-                            >
-                              <span className="font-semibold text-white">
-                                @{m.username}
-                              </span>
-                              {m.is_you && (
-                                <span className="text-[10px] font-bold text-amber-300 bg-amber-400/20 border border-amber-400/40 px-2 py-0.5 rounded">
-                                  You
-                                </span>
-                              )}
-                            </li>
-                          ))}
-                        </ul>
-                      )}
-                    </div>
-
-                    {/* Media preview */}
-                    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4 shadow-2xl">
-                      <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                        <ImageIcon className="w-4 h-4 text-amber-400" /> Current
-                        Storefront & Food Showcase
-                      </h3>
-                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                        {MEDIA_TABS.map((m) => (
-                          <div key={m.key} className="space-y-1.5">
-                            <span className="text-xs text-slate-400 font-medium">
-                              {m.label}
-                            </span>
-                            <div className="relative h-40 w-full rounded-xl border border-slate-800 bg-slate-950 overflow-hidden flex items-center justify-center">
-                              {ownedRestaurant.media?.[m.key] ? (
-                                (() => {
-                                  const { items, keys } = restaurantMediaItems(
-                                    ownedRestaurant.media
-                                  );
-                                  const idx = keys.indexOf(m.key);
-                                  if (idx < 0) return null;
-                                  return (
-                                    <ViewableMedia
-                                      items={items}
-                                      index={idx}
-                                      caption={ownedRestaurant.name}
-                                      showHint
-                                      community={{
-                                        restaurantId: ownedRestaurant.id,
-                                        supabase,
-                                        user,
-                                        notify: setNotice,
-                                      }}
-                                      className="absolute inset-0 w-full h-full"
-                                    >
-                                      <MediaPreview
-                                        item={items[idx]}
-                                        alt={m.label}
-                                        className="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
-                                      />
-                                    </ViewableMedia>
-                                  );
-                                })()
-                              ) : (
-                                <span className="text-xs text-slate-600">
-                                  No photo uploaded
-                                </span>
-                              )}
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-
-                    {/* Reviews */}
-                    <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-4 shadow-2xl">
-                      <h3 className="text-sm font-bold text-white flex items-center gap-2">
-                        <MessageSquare className="w-4 h-4 text-emerald-400" />{' '}
-                        Customer Ratings & Photos
-                      </h3>
-                      <div className="space-y-3">
-                        {reviews.length > 0 ? (
-                          reviews.map((rev: any) => (
-                            <div
-                              key={rev.id}
-                              className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-2"
-                            >
-                              <div className="flex items-center justify-between">
-                                <span className="font-bold text-xs text-white">
-                                  @{rev.username}
-                                </span>
-                                <span className="flex items-center gap-1.5 text-amber-300 text-xs font-bold">
-                                  <StarDisplay value={Number(rev.rating)} />
-                                  {Number(rev.rating).toFixed(1)}
-                                </span>
-                              </div>
-                              {rev.comment && (
-                                <p className="text-xs text-slate-300 whitespace-pre-wrap break-words">
-                                  {rev.comment}
-                                </p>
-                              )}
-                              <ReviewPhotoStrip
-                                photos={rev.photos}
-                                urls={photoUrls}
-                                caption={`Photo by @${rev.username}`}
-                              />
-                            </div>
-                          ))
-                        ) : (
-                          <p className="text-xs text-slate-500 text-center py-6">
-                            No ratings for your restaurant yet.
-                          </p>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()
+              <OwnerPortal
+                restaurant={ownedRestaurant}
+                supabase={supabase}
+                user={user}
+                reviews={reviews}
+                team={team}
+                teamError={teamError}
+                photoUrls={photoUrls}
+                onMediaChange={handleMediaChange}
+                onCertLinkChange={handleCertLinkChange}
+                notify={setNotice}
+                onViewListing={viewMyListing}
+              />
             )}
           </div>
         ) : (
@@ -5172,69 +5907,6 @@ export default function UKHalalAppMapbox() {
         </div>
       )}
 
-      {/* OWNER EDIT */}
-      {showOwnerModal && ownedRestaurant && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-700 rounded-2xl max-w-lg w-full p-6 space-y-4 shadow-2xl overflow-y-auto max-h-[90vh]">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <h3 className="font-bold text-base text-white flex items-center gap-2">
-                <Store className="w-5 h-5 text-amber-400" /> Media &
-                Verification Portal
-              </h3>
-              <button
-                onClick={() => setShowOwnerModal(false)}
-                className="text-xs text-slate-400 hover:text-white"
-              >
-                Close ✕
-              </button>
-            </div>
-
-            <div className="space-y-3 text-xs">
-              {[
-                ...MEDIA_TABS.map((m) => ({
-                  key: MEDIA_FORM_KEY[m.key] as string,
-                  label: `${m.label} image or video link:`,
-                })),
-                {
-                  key: 'certificateLink',
-                  label: 'Certificate Website Link:',
-                },
-              ].map((f) => (
-                <div key={f.key}>
-                  <label className="text-slate-400 font-medium">
-                    {f.label}
-                  </label>
-                  <input
-                    type="url"
-                    value={(editForm as any)[f.key]}
-                    onChange={(e) =>
-                      setEditForm({ ...editForm, [f.key]: e.target.value })
-                    }
-                    placeholder="https://..."
-                    className="w-full mt-1 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-white"
-                  />
-                </div>
-              ))}
-            </div>
-
-            <div className="flex justify-end gap-2 pt-3 border-t border-slate-800">
-              <button
-                onClick={() => setShowOwnerModal(false)}
-                className="px-4 py-2 rounded-lg bg-slate-800 text-slate-300 text-xs font-semibold hover:bg-slate-700"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleSaveOwnerChanges}
-                disabled={saving}
-                className="px-4 py-2 rounded-lg bg-amber-400 text-slate-950 text-xs font-bold hover:bg-amber-300 shadow disabled:opacity-50"
-              >
-                {saving ? 'Saving...' : 'Save Changes'}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
