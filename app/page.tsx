@@ -1317,11 +1317,14 @@ function VideoReel({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const setStat = (k: string, patch: Partial<{ likes: number; comments: number; liked: boolean }>) =>
-  setStats((prev) => ({
-    ...prev,
-    [k]: { likes: 0, comments: 0, liked: false, ...prev[k], ...patch },
-  }));
+  const setStat = (
+    k: string,
+    patch: Partial<{ likes: number; comments: number; liked: boolean }>
+  ) =>
+    setStats((prev) => {
+      const base = prev[k] ?? { likes: 0, comments: 0, liked: false };
+      return { ...prev, [k]: { ...base, ...patch } };
+    });
 
   const doLike = async (onlyIfNotLiked = false) => {
     if (!community || !community.user || !key) return;
