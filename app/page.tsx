@@ -1318,10 +1318,10 @@ function VideoReel({
   }, []);
 
   const setStat = (k: string, patch: Partial<{ likes: number; comments: number; liked: boolean }>) =>
-    setStats((prev) => ({
-      ...prev,
-      [k]: { likes: 0, comments: 0, liked: false, ...prev[k], ...patch },
-    }));
+  setStats((prev) => ({
+    ...prev,
+    [k]: { likes: 0, comments: 0, liked: false, ...prev[k], ...patch },
+  }));
 
   const doLike = async (onlyIfNotLiked = false) => {
     if (!community || !community.user || !key) return;
