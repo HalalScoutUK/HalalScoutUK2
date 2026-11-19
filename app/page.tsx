@@ -6,6 +6,7 @@ import React, {
   useLayoutEffect,
   useMemo,
   useRef,
+  useCallback,
 } from 'react';
 import { createPortal } from 'react-dom';
 import * as tus from 'tus-js-client';
@@ -48,6 +49,8 @@ import {
   ThumbsUp,
   Compass,
   Trophy,
+  Plus,
+  ClipboardCheck,
 } from 'lucide-react';
 
 /* ------------------------------------------------------------------ */
@@ -2947,6 +2950,998 @@ function OwnerPortal({
   );
 }
 
+// ===========================================================================
+// Adding restaurants from the app.
+//  * Admins add a restaurant and it goes live straight away.
+//  * Trusted Scouts (1,000+ points) suggest one; it waits in the review queue
+//    until an admin approves it. The database enforces all of this, the app
+//    only decides which buttons to show.
+// ===========================================================================
+
+const ADD_CATEGORIES: { key: string; label: string; hint: string }[] = [
+  {
+    key: 'HMC_CERTIFIED',
+    label: 'HMC certified',
+    hint: 'Has a current HMC certificate',
+  },
+  {
+    key: 'HALAL_CERTIFIED',
+    label: 'Other halal certificate',
+    hint: 'Certified by another body (e.g. HFA)',
+  },
+  {
+    key: 'HALAL_OPTIONS',
+    label: 'Halal options',
+    hint: 'Serves some halal food, no certificate',
+  },
+];
+
+function mapRestaurantRow(r: any): any {
+  return {
+    ...r,
+    halalCategory: r.halal_category || 'HMC_CERTIFIED',
+    servesAlcohol: r.serves_alcohol ?? false,
+    certificateIssuer: r.certificate_issuer || null,
+    certificateNumber: r.certificate_number || null,
+    certificateLink: r.certificate_link || '',
+    media: r.media || {},
+    avgRating: null,
+    reviewCount: 0,
+    tags: [],
+  };
+}
+
+function addPlaceError(message: string): string {
+  const m = message || '';
+  const table: [string, string][] = [
+    ['invalid_name', 'Enter the restaurant name (no web links).'],
+    ['invalid_postcode', 'That does not look like a UK postcode.'],
+    [
+      'invalid_location',
+      'The map pin is outside the UK. Check the postcode and coordinates.',
+    ],
+    ['invalid_phone', 'Phone numbers can only use digits, spaces, + ( ) and -.'],
+    ['invalid_website', 'The website must start with http:// or https://'],
+    ['invalid_link', 'The certificate link must start with http:// or https://'],
+    ['invalid_category', 'Choose a halal category.'],
+    ['valid_until_required', 'Certified places need a certificate expiry date.'],
+    [
+      'invalid_valid_until',
+      'That expiry date is too far away. Check the date.',
+    ],
+    ['note_required', 'Tell us how you know it is halal (at least 10 characters).'],
+    ['note_too_long', 'Keep the note under 500 characters.'],
+    [
+      'duplicate_restaurant',
+      'A restaurant with this name and postcode is already on the app (or waiting for review).',
+    ],
+    ['rate_limited', 'You have added a lot today. Please try again tomorrow.'],
+    [
+      'too_many_pending',
+      'You already have 20 waiting for review. Please wait for some to be reviewed.',
+    ],
+    ['not_allowed', 'Only Trusted Scouts (1,000+ points) can add restaurants.'],
+    ['not_admin', 'Only admins can do this.'],
+    ['submission_not_pending', 'Someone has already reviewed this one.'],
+    ['not_authenticated', 'Please sign in first.'],
+  ];
+  for (const [k, v] of table) if (m.includes(k)) return v;
+  return 'Something went wrong. Please try again.';
+}
+
+async function lookupPostcode(
+  raw: string
+): Promise<{ lat: number; lng: number; city: string } | null> {
+  const pc = raw.replace(/\s+/g, '').toUpperCase();
+  if (!/^[A-Z]{1,2}[0-9][A-Z0-9]?[0-9][A-Z]{2}$/.test(pc)) return null;
+  try {
+    const res = await fetch(
+      `https://api.postcodes.io/postcodes/${encodeURIComponent(pc)}`
+    );
+    if (!res.ok) return null;
+    const json: any = await res.json();
+    const r = json?.result;
+    if (!r || typeof r.latitude !== 'number' || typeof r.longitude !== 'number')
+      return null;
+    return {
+      lat: r.latitude,
+      lng: r.longitude,
+      city: String(r.admin_district || r.region || ''),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function toNumOrNull(s: string): number | null {
+  const t = s.trim();
+  if (t === '') return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+type PlaceForm = {
+  name: string;
+  address: string;
+  city: string;
+  postcode: string;
+  phone: string;
+  website: string;
+  lat: string;
+  lng: string;
+  category: string;
+  alcohol: boolean;
+  certLink: string;
+  issuer: string;
+  validUntil: string;
+  note: string;
+};
+
+const EMPTY_PLACE: PlaceForm = {
+  name: '',
+  address: '',
+  city: '',
+  postcode: '',
+  phone: '',
+  website: '',
+  lat: '',
+  lng: '',
+  category: 'HALAL_OPTIONS',
+  alcohol: false,
+  certLink: '',
+  issuer: '',
+  validUntil: '',
+  note: '',
+};
+
+const FIELD =
+  'w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500';
+const LABEL = 'block text-[11px] font-bold uppercase tracking-wide text-slate-400 mb-1';
+
+function PlaceFields({
+  form,
+  setForm,
+  showNote,
+  onLookup,
+  looking,
+  lookupMsg,
+}: {
+  form: PlaceForm;
+  setForm: (f: PlaceForm) => void;
+  showNote: boolean;
+  onLookup: () => void;
+  looking: boolean;
+  lookupMsg: string;
+}) {
+  const set = (patch: Partial<PlaceForm>) => setForm({ ...form, ...patch });
+  const certified = form.category !== 'HALAL_OPTIONS';
+  const latN = toNumOrNull(form.lat);
+  const lngN = toNumOrNull(form.lng);
+  return (
+    <div className="space-y-4">
+      <div>
+        <label className={LABEL}>Restaurant name</label>
+        <input
+          className={FIELD}
+          value={form.name}
+          maxLength={120}
+          onChange={(e) => set({ name: e.target.value })}
+          placeholder="e.g. Mak Halal Kitchen"
+        />
+      </div>
+
+      <div className="grid sm:grid-cols-2 gap-3">
+        <div>
+          <label className={LABEL}>Postcode</label>
+          <div className="flex gap-2">
+            <input
+              className={FIELD}
+              value={form.postcode}
+              maxLength={9}
+              onChange={(e) => set({ postcode: e.target.value.toUpperCase() })}
+              placeholder="B10 9SN"
+            />
+            <button
+              type="button"
+              onClick={onLookup}
+              disabled={looking}
+              className="shrink-0 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold"
+            >
+              {looking ? '...' : 'Find'}
+            </button>
+          </div>
+          {lookupMsg && (
+            <p className="text-[11px] text-slate-400 mt-1">{lookupMsg}</p>
+          )}
+        </div>
+        <div>
+          <label className={LABEL}>Town / city</label>
+          <input
+            className={FIELD}
+            value={form.city}
+            maxLength={80}
+            onChange={(e) => set({ city: e.target.value })}
+            placeholder="Birmingham"
+          />
+        </div>
+      </div>
+
+      <div>
+        <label className={LABEL}>Street address</label>
+        <input
+          className={FIELD}
+          value={form.address}
+          maxLength={200}
+          onChange={(e) => set({ address: e.target.value })}
+          placeholder="123 High Street"
+        />
+      </div>
+
+      <div className="grid sm:grid-cols-2 gap-3">
+        <div>
+          <label className={LABEL}>Phone (optional)</label>
+          <input
+            className={FIELD}
+            value={form.phone}
+            maxLength={20}
+            onChange={(e) => set({ phone: e.target.value })}
+            placeholder="0121 000 0000"
+          />
+        </div>
+        <div>
+          <label className={LABEL}>Website (optional)</label>
+          <input
+            className={FIELD}
+            value={form.website}
+            maxLength={300}
+            onChange={(e) => set({ website: e.target.value })}
+            placeholder="https://..."
+          />
+        </div>
+      </div>
+
+      <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-3 space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <span className={LABEL + ' mb-0'}>Map pin</span>
+          {latN != null && lngN != null && (
+            <a
+              href={`https://www.google.com/maps?q=${latN},${lngN}`}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[11px] text-emerald-400 hover:underline"
+            >
+              Check on Google Maps
+            </a>
+          )}
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <input
+            className={FIELD}
+            value={form.lat}
+            inputMode="decimal"
+            onChange={(e) => set({ lat: e.target.value })}
+            placeholder="Latitude"
+          />
+          <input
+            className={FIELD}
+            value={form.lng}
+            inputMode="decimal"
+            onChange={(e) => set({ lng: e.target.value })}
+            placeholder="Longitude"
+          />
+        </div>
+        <p className="text-[11px] text-slate-500">
+          &ldquo;Find&rdquo; puts the pin at the middle of the postcode, which can be
+          a street or two out. To be exact, right-click the shop in Google Maps,
+          copy the two numbers and paste them here.
+        </p>
+      </div>
+
+      <div>
+        <label className={LABEL}>Halal status</label>
+        <div className="grid sm:grid-cols-3 gap-2">
+          {ADD_CATEGORIES.map((c) => (
+            <button
+              type="button"
+              key={c.key}
+              onClick={() => set({ category: c.key })}
+              className={`text-left rounded-xl border px-3 py-2 transition ${
+                form.category === c.key
+                  ? 'border-emerald-500 bg-emerald-500/15'
+                  : 'border-slate-700 bg-slate-900 hover:border-slate-500'
+              }`}
+            >
+              <div className="text-sm font-bold text-white">{c.label}</div>
+              <div className="text-[11px] text-slate-400">{c.hint}</div>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {certified && (
+        <div className="grid sm:grid-cols-2 gap-3 rounded-xl border border-slate-700 bg-slate-900/60 p-3">
+          <div>
+            <label className={LABEL}>Certificate expires</label>
+            <input
+              type="date"
+              className={FIELD}
+              value={form.validUntil}
+              onChange={(e) => set({ validUntil: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className={LABEL}>
+              Certified by{' '}
+              {form.category === 'HMC_CERTIFIED' ? '(optional)' : ''}
+            </label>
+            <input
+              className={FIELD}
+              value={form.issuer}
+              maxLength={80}
+              onChange={(e) => set({ issuer: e.target.value })}
+              placeholder={
+                form.category === 'HMC_CERTIFIED' ? 'HMC' : 'e.g. HFA'
+              }
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <label className={LABEL}>Link to the certificate (optional)</label>
+            <input
+              className={FIELD}
+              value={form.certLink}
+              maxLength={300}
+              onChange={(e) => set({ certLink: e.target.value })}
+              placeholder="https://..."
+            />
+          </div>
+        </div>
+      )}
+
+      <label className="flex items-center gap-2 text-sm text-slate-200 cursor-pointer">
+        <input
+          type="checkbox"
+          checked={form.alcohol}
+          onChange={(e) => set({ alcohol: e.target.checked })}
+          className="w-4 h-4 accent-emerald-500"
+        />
+        Alcohol is served here
+      </label>
+
+      {showNote && (
+        <div>
+          <label className={LABEL}>How do you know it is halal?</label>
+          <textarea
+            className={FIELD + ' min-h-[84px]'}
+            value={form.note}
+            maxLength={500}
+            onChange={(e) => set({ note: e.target.value })}
+            placeholder="e.g. I visited on 12 Nov. The owner showed me their HMC certificate on the wall, valid to March 2027."
+          />
+          <p className="text-[11px] text-slate-500 mt-1">
+            An admin reads this before approving. {form.note.length}/500
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AddPlacePage({
+  supabase,
+  level,
+  onBack,
+  onAdded,
+  onChanged,
+  onViewOnMap,
+  setNotice,
+}: {
+  supabase: any;
+  level: 'admin' | 'trusted';
+  onBack: () => void;
+  onAdded: (row: any) => void;
+  onChanged: () => void;
+  onViewOnMap: (lat: number, lng: number) => void;
+  setNotice: (s: string) => void;
+}) {
+  const [form, setForm] = useState<PlaceForm>(EMPTY_PLACE);
+  const [busy, setBusy] = useState(false);
+  const [looking, setLooking] = useState(false);
+  const [lookupMsg, setLookupMsg] = useState('');
+  const [error, setError] = useState('');
+  const [mine, setMine] = useState<any[]>([]);
+  const [mineError, setMineError] = useState(false);
+  const isAdmin = level === 'admin';
+
+  const loadMine = useCallback(async () => {
+    if (isAdmin) return;
+    const { data, error: e } = await supabase.rpc('get_my_submissions');
+    if (e) {
+      setMineError(true);
+      return;
+    }
+    setMineError(false);
+    setMine((data as any[]) ?? []);
+  }, [supabase, isAdmin]);
+
+  useEffect(() => {
+    loadMine();
+  }, [loadMine]);
+
+  async function doLookup() {
+    setLooking(true);
+    setLookupMsg('');
+    const r = await lookupPostcode(form.postcode);
+    setLooking(false);
+    if (!r) {
+      setLookupMsg('Could not find that postcode. Check it, or enter the pin by hand.');
+      return;
+    }
+    setForm({
+      ...form,
+      lat: r.lat.toFixed(6),
+      lng: r.lng.toFixed(6),
+      city: form.city.trim() ? form.city : r.city,
+    });
+    setLookupMsg('Pin set to the middle of the postcode.');
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (busy) return;
+    setError('');
+    let f = form;
+    if (toNumOrNull(f.lat) == null || toNumOrNull(f.lng) == null) {
+      setBusy(true);
+      const r = await lookupPostcode(f.postcode);
+      setBusy(false);
+      if (!r) {
+        setError('Add the map pin: press Find next to the postcode, or enter the coordinates.');
+        return;
+      }
+      f = {
+        ...f,
+        lat: r.lat.toFixed(6),
+        lng: r.lng.toFixed(6),
+        city: f.city.trim() ? f.city : r.city,
+      };
+      setForm(f);
+    }
+    const lat = toNumOrNull(f.lat);
+    const lng = toNumOrNull(f.lng);
+    if (lat == null || lng == null) {
+      setError('The map pin numbers are not valid.');
+      return;
+    }
+    const certified = f.category !== 'HALAL_OPTIONS';
+    if (certified && !f.validUntil) {
+      setError('Certified places need a certificate expiry date.');
+      return;
+    }
+    setBusy(true);
+    try {
+      if (isAdmin) {
+        const { data, error: err } = await supabase.rpc('admin_add_restaurant', {
+          p_name: f.name,
+          p_address: f.address,
+          p_city: f.city,
+          p_postcode: f.postcode,
+          p_phone: f.phone,
+          p_website: f.website,
+          p_lat: lat,
+          p_lng: lng,
+          p_category: f.category,
+          p_serves_alcohol: f.alcohol,
+          p_certificate_link: certified ? f.certLink : '',
+          p_issuer: certified ? f.issuer : '',
+          p_valid_until: certified ? f.validUntil : null,
+        });
+        if (err) {
+          setError(addPlaceError(err.message));
+          return;
+        }
+        const { data: row } = await supabase
+          .from('restaurants')
+          .select('*')
+          .eq('id', data)
+          .maybeSingle();
+        if (row) onAdded(mapRestaurantRow(row));
+        setNotice(`${f.name.trim()} is now live on the map.`);
+        setForm(EMPTY_PLACE);
+        setLookupMsg('');
+        onViewOnMap(lat, lng);
+      } else {
+        const { error: err } = await supabase.rpc('submit_restaurant', {
+          p_name: f.name,
+          p_address: f.address,
+          p_city: f.city,
+          p_postcode: f.postcode,
+          p_phone: f.phone,
+          p_website: f.website,
+          p_lat: lat,
+          p_lng: lng,
+          p_category: f.category,
+          p_serves_alcohol: f.alcohol,
+          p_certificate_link: certified ? f.certLink : '',
+          p_note: f.note,
+        });
+        if (err) {
+          setError(addPlaceError(err.message));
+          return;
+        }
+        setNotice('Thanks! An admin will review it before it goes live.');
+        setForm(EMPTY_PLACE);
+        setLookupMsg('');
+        loadMine();
+        onChanged();
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function withdraw(id: number) {
+    const { error: err } = await supabase.rpc('withdraw_restaurant_submission', {
+      p_id: id,
+    });
+    if (err) {
+      setNotice('Could not withdraw that. Please try again.');
+      return;
+    }
+    loadMine();
+    onChanged();
+  }
+
+  const statusPill = (s: string) =>
+    s === 'approved'
+      ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+      : s === 'rejected'
+      ? 'bg-rose-500/15 text-rose-300 border-rose-500/40'
+      : 'bg-amber-400/15 text-amber-300 border-amber-400/40';
+
+  return (
+    <div className="space-y-5 max-w-2xl">
+      <div className="space-y-1">
+        <button onClick={onBack} className="text-xs text-emerald-400 hover:underline">
+          &larr; Back to the map
+        </button>
+        <h2 className="text-2xl font-black text-white">Add a restaurant</h2>
+        <p className="text-sm text-slate-400">
+          {isAdmin
+            ? 'As an admin, what you add goes live on the map straight away.'
+            : 'As a Trusted Scout you can suggest new places. An admin checks each one before it appears on the map.'}
+        </p>
+      </div>
+
+      <form
+        onSubmit={submit}
+        className="bg-slate-800/60 border border-slate-700 rounded-2xl p-4 sm:p-5 space-y-4"
+      >
+        <PlaceFields
+          form={form}
+          setForm={setForm}
+          showNote={!isAdmin}
+          onLookup={doLookup}
+          looking={looking}
+          lookupMsg={lookupMsg}
+        />
+        {error && (
+          <p className="text-sm text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-xl px-3 py-2">
+            {error}
+          </p>
+        )}
+        <button
+          type="submit"
+          disabled={busy}
+          className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-black rounded-xl py-2.5 text-sm transition"
+        >
+          {busy
+            ? 'Saving...'
+            : isAdmin
+            ? 'Add to the map'
+            : 'Submit for review'}
+        </button>
+      </form>
+
+      {!isAdmin && (
+        <div className="space-y-2">
+          <h3 className="text-sm font-bold text-white">Your submissions</h3>
+          {mineError ? (
+            <p className="text-sm text-rose-300">Could not load your submissions.</p>
+          ) : mine.length === 0 ? (
+            <p className="text-sm text-slate-500">Nothing submitted yet.</p>
+          ) : (
+            <ul className="space-y-2">
+              {mine.map((s: any) => (
+                <li
+                  key={s.id}
+                  className="bg-slate-800/60 border border-slate-700 rounded-xl px-3 py-2.5 flex flex-wrap items-center justify-between gap-2"
+                >
+                  <div className="min-w-0">
+                    <div className="text-sm font-bold text-white truncate">
+                      {s.name}
+                    </div>
+                    <div className="text-[11px] text-slate-400">
+                      {s.postcode}
+                      {s.city ? `, ${s.city}` : ''}
+                    </div>
+                    {s.status === 'rejected' && s.review_note && (
+                      <div className="text-[11px] text-rose-300 mt-1">
+                        Admin note: {s.review_note}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`text-[10px] font-bold uppercase px-2 py-0.5 rounded border ${statusPill(
+                        s.status
+                      )}`}
+                    >
+                      {s.status === 'pending' ? 'Waiting for review' : s.status}
+                    </span>
+                    {s.status === 'pending' && (
+                      <button
+                        onClick={() => withdraw(s.id)}
+                        className="text-[11px] text-slate-400 hover:text-rose-300 underline"
+                      >
+                        Withdraw
+                      </button>
+                    )}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QueueCard({
+  sub,
+  supabase,
+  onDone,
+  onAdded,
+  setNotice,
+}: {
+  sub: any;
+  supabase: any;
+  onDone: (id: number) => void;
+  onAdded: (row: any) => void;
+  setNotice: (s: string) => void;
+}) {
+  const [form, setForm] = useState<PlaceForm>({
+    name: sub.name ?? '',
+    address: sub.address ?? '',
+    city: sub.city ?? '',
+    postcode: sub.postcode ?? '',
+    phone: sub.phone ?? '',
+    website: sub.website ?? '',
+    lat: String(sub.lat ?? ''),
+    lng: String(sub.lng ?? ''),
+    category: sub.halal_category ?? 'HALAL_OPTIONS',
+    alcohol: !!sub.serves_alcohol,
+    certLink: sub.certificate_link ?? '',
+    issuer: '',
+    validUntil: '',
+    note: '',
+  });
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [looking, setLooking] = useState(false);
+  const [lookupMsg, setLookupMsg] = useState('');
+  const [error, setError] = useState('');
+  const [rejecting, setRejecting] = useState(false);
+  const [rejectNote, setRejectNote] = useState('');
+
+  async function doLookup() {
+    setLooking(true);
+    const r = await lookupPostcode(form.postcode);
+    setLooking(false);
+    if (!r) {
+      setLookupMsg('Postcode not found.');
+      return;
+    }
+    setForm({
+      ...form,
+      lat: r.lat.toFixed(6),
+      lng: r.lng.toFixed(6),
+      city: form.city.trim() ? form.city : r.city,
+    });
+    setLookupMsg('Pin moved to the postcode centre.');
+  }
+
+  async function approve() {
+    setError('');
+    const lat = toNumOrNull(form.lat);
+    const lng = toNumOrNull(form.lng);
+    if (lat == null || lng == null) {
+      setError('The map pin numbers are not valid.');
+      return;
+    }
+    const certified = form.category !== 'HALAL_OPTIONS';
+    if (certified && !form.validUntil) {
+      setError('Enter the certificate expiry date before approving.');
+      return;
+    }
+    setBusy(true);
+    const { data, error: err } = await supabase.rpc(
+      'approve_restaurant_submission',
+      {
+        p_id: sub.id,
+        p_name: form.name,
+        p_address: form.address,
+        p_city: form.city,
+        p_postcode: form.postcode,
+        p_phone: form.phone,
+        p_website: form.website,
+        p_lat: lat,
+        p_lng: lng,
+        p_category: form.category,
+        p_serves_alcohol: form.alcohol,
+        p_certificate_link: certified ? form.certLink : '',
+        p_issuer: certified ? form.issuer : '',
+        p_valid_until: certified ? form.validUntil : null,
+      }
+    );
+    if (err) {
+      setBusy(false);
+      setError(addPlaceError(err.message));
+      return;
+    }
+    const { data: row } = await supabase
+      .from('restaurants')
+      .select('*')
+      .eq('id', data)
+      .maybeSingle();
+    if (row) onAdded(mapRestaurantRow(row));
+    setNotice(`${form.name.trim()} approved and live.`);
+    setBusy(false);
+    onDone(sub.id);
+  }
+
+  async function reject() {
+    setBusy(true);
+    const { error: err } = await supabase.rpc('reject_restaurant_submission', {
+      p_id: sub.id,
+      p_note: rejectNote,
+    });
+    setBusy(false);
+    if (err) {
+      setError(addPlaceError(err.message));
+      return;
+    }
+    setNotice('Submission rejected.');
+    onDone(sub.id);
+  }
+
+  const cat = ADD_CATEGORIES.find((c) => c.key === form.category);
+
+  return (
+    <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-4 space-y-3">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="min-w-0">
+          <div className="text-base font-black text-white">{sub.name}</div>
+          <div className="text-xs text-slate-400">
+            {[sub.address, sub.city, sub.postcode].filter(Boolean).join(', ')}
+          </div>
+        </div>
+        <span className="text-[10px] font-bold uppercase px-2 py-0.5 rounded border border-emerald-500/40 bg-emerald-500/10 text-emerald-300">
+          {cat?.label ?? sub.halal_category}
+        </span>
+      </div>
+
+      <div className="text-[11px] text-slate-400">
+        Suggested by{' '}
+        <span className="text-white font-bold">@{sub.submitter_username}</span>{' '}
+        ({sub.submitter_points} pts) on{' '}
+        {new Date(sub.created_at).toLocaleDateString('en-GB')}
+      </div>
+
+      <div className="bg-slate-900/70 border border-slate-700 rounded-xl px-3 py-2">
+        <div className="text-[10px] font-bold uppercase text-slate-500 mb-0.5">
+          Their evidence
+        </div>
+        <p className="text-sm text-slate-200 whitespace-pre-wrap break-words">
+          {sub.note || 'No note.'}
+        </p>
+        {sub.certificate_link && (
+          <a
+            href={sub.certificate_link}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-emerald-400 hover:underline break-all"
+          >
+            Open the certificate link
+          </a>
+        )}
+      </div>
+
+      <div className="flex flex-wrap gap-3 text-xs">
+        <a
+          href={`https://www.google.com/maps?q=${encodeURIComponent(
+            `${sub.name} ${sub.postcode}`
+          )}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-emerald-400 hover:underline"
+        >
+          Search it on Google Maps
+        </a>
+        <button
+          type="button"
+          onClick={() => setOpen(!open)}
+          className="text-slate-300 hover:text-white underline"
+        >
+          {open ? 'Hide details' : 'Edit details before approving'}
+        </button>
+      </div>
+
+      {open && (
+        <div>
+          <PlaceFields
+            form={form}
+            setForm={setForm}
+            showNote={false}
+            onLookup={doLookup}
+            looking={looking}
+            lookupMsg={lookupMsg}
+          />
+        </div>
+      )}
+
+      {!open && form.category !== 'HALAL_OPTIONS' && (
+        <div className="grid sm:grid-cols-2 gap-3">
+          <div>
+            <label className={LABEL}>Certificate expires (required)</label>
+            <input
+              type="date"
+              className={FIELD}
+              value={form.validUntil}
+              onChange={(e) => setForm({ ...form, validUntil: e.target.value })}
+            />
+          </div>
+          <div>
+            <label className={LABEL}>Certified by</label>
+            <input
+              className={FIELD}
+              value={form.issuer}
+              maxLength={80}
+              onChange={(e) => setForm({ ...form, issuer: e.target.value })}
+              placeholder={form.category === 'HMC_CERTIFIED' ? 'HMC' : 'e.g. HFA'}
+            />
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <p className="text-sm text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-xl px-3 py-2">
+          {error}
+        </p>
+      )}
+
+      {rejecting ? (
+        <div className="space-y-2">
+          <input
+            className={FIELD}
+            value={rejectNote}
+            maxLength={300}
+            onChange={(e) => setRejectNote(e.target.value)}
+            placeholder="Reason (the scout will see this)"
+          />
+          <div className="flex gap-2">
+            <button
+              onClick={reject}
+              disabled={busy}
+              className="flex-1 bg-rose-500 hover:bg-rose-400 disabled:opacity-50 text-white font-bold rounded-xl py-2 text-sm"
+            >
+              Confirm reject
+            </button>
+            <button
+              onClick={() => setRejecting(false)}
+              className="px-4 rounded-xl border border-slate-600 text-slate-300 text-sm"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex gap-2">
+          <button
+            onClick={approve}
+            disabled={busy}
+            className="flex-1 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-black rounded-xl py-2 text-sm"
+          >
+            {busy ? 'Working...' : 'Approve and publish'}
+          </button>
+          <button
+            onClick={() => setRejecting(true)}
+            disabled={busy}
+            className="px-4 rounded-xl border border-rose-500/50 text-rose-300 hover:bg-rose-500/10 text-sm font-bold"
+          >
+            Reject
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReviewQueuePage({
+  supabase,
+  onBack,
+  onAdded,
+  onChanged,
+  setNotice,
+}: {
+  supabase: any;
+  onBack: () => void;
+  onAdded: (row: any) => void;
+  onChanged: () => void;
+  setNotice: (s: string) => void;
+}) {
+  const [items, setItems] = useState<any[] | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  const load = useCallback(async () => {
+    const { data, error } = await supabase.rpc('get_pending_submissions');
+    if (error) {
+      setFailed(true);
+      setItems([]);
+      return;
+    }
+    setFailed(false);
+    setItems((data as any[]) ?? []);
+  }, [supabase]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <div className="space-y-5 max-w-2xl">
+      <div className="space-y-1">
+        <button onClick={onBack} className="text-xs text-emerald-400 hover:underline">
+          &larr; Back to the map
+        </button>
+        <h2 className="text-2xl font-black text-white">Review queue</h2>
+        <p className="text-sm text-slate-400">
+          Restaurants suggested by Trusted Scouts. Nothing here is public until you
+          approve it.
+        </p>
+      </div>
+
+      {items === null ? (
+        <p className="text-sm text-slate-400">Loading...</p>
+      ) : failed ? (
+        <p className="text-sm text-rose-300">
+          Could not load the queue. Have you run add-restaurants.sql?
+        </p>
+      ) : items.length === 0 ? (
+        <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 text-center text-sm text-slate-400">
+          All caught up. Nothing is waiting for review.
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {items.map((s: any) => (
+            <QueueCard
+              key={s.id}
+              sub={s}
+              supabase={supabase}
+              setNotice={setNotice}
+              onAdded={onAdded}
+              onDone={(id: number) => {
+                setItems((prev) => (prev ? prev.filter((x: any) => x.id !== id) : prev));
+                onChanged();
+              }}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* Component                                                          */
 /* ------------------------------------------------------------------ */
@@ -2994,7 +3989,13 @@ export default function UKHalalAppMapbox() {
   const [editingPhotos, setEditingPhotos] = useState<
     { id: number; path: string }[]
   >([]);
-  const [page, setPage] = useState<'HOME' | 'MY_REVIEWS'>('HOME');
+  const [page, setPage] = useState<
+    'HOME' | 'MY_REVIEWS' | 'ADD_PLACE' | 'REVIEW_QUEUE'
+  >('HOME');
+  const [addLevel, setAddLevel] = useState<'none' | 'trusted' | 'admin'>(
+    'none'
+  );
+  const [pendingCount, setPendingCount] = useState(0);
   const [reviewSort, setReviewSort] = useState<'newest' | 'oldest'>('newest');
   const [myReviews, setMyReviews] = useState<any[]>([]);
   const [myReviewsError, setMyReviewsError] = useState(false);
@@ -3094,6 +4095,7 @@ export default function UKHalalAppMapbox() {
         fetchVisited();
         loadMyReviews();
         checkUserProfile(u.id);
+        loadAddAccess();
       } else {
         setFavorites([]);
         setVisited([]);
@@ -3103,6 +4105,8 @@ export default function UKHalalAppMapbox() {
         setOwnedRestaurantIds([]);
         setRole('USER');
         setMyPoints(0);
+        setAddLevel('none');
+        setPendingCount(0);
         setSelectedFilter((f) => (f === 'FAVOURITES' ? 'ALL' : f));
       }
     });
@@ -3209,6 +4213,26 @@ export default function UKHalalAppMapbox() {
       .from('check_ins')
       .select('restaurant_id');
     if (!error && data) setVisited(data.map((v: any) => v.restaurant_id));
+  }
+
+  async function loadAddAccess() {
+    const { data, error } = await supabase.rpc('get_add_place_access');
+    const row: any = Array.isArray(data) ? data[0] : data;
+    if (error || !row) {
+      setAddLevel('none');
+      setPendingCount(0);
+      return;
+    }
+    setAddLevel(
+      row.level === 'admin' || row.level === 'trusted' ? row.level : 'none'
+    );
+    setPendingCount(Number(row.pending_count) || 0);
+  }
+
+  function handlePlaceAdded(row: any) {
+    setRestaurants((prev) =>
+      prev.some((r: any) => r.id === row.id) ? prev : [...prev, row]
+    );
   }
 
   async function refreshPoints(userId: string) {
@@ -4264,6 +5288,49 @@ export default function UKHalalAppMapbox() {
 
           {/* RIGHT: Profile & Sign Out / Sign In */}
           <div className="flex items-center gap-3">
+            {user && addLevel !== 'none' && (
+              <button
+                onClick={() => {
+                  setRole('USER');
+                  setPage('ADD_PLACE');
+                  loadAddAccess();
+                }}
+                aria-label="Add a restaurant"
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold border transition shadow-inner ${
+                  page === 'ADD_PLACE'
+                    ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+                    : 'bg-slate-800/90 hover:bg-slate-800 border-slate-700 text-white'
+                }`}
+              >
+                <Plus className="w-4 h-4 text-emerald-400" />
+                <span className="hidden sm:inline">Add place</span>
+              </button>
+            )}
+
+            {user && addLevel === 'admin' && (
+              <button
+                onClick={() => {
+                  setRole('USER');
+                  setPage('REVIEW_QUEUE');
+                  loadAddAccess();
+                }}
+                aria-label="Review queue"
+                className={`relative flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold border transition shadow-inner ${
+                  page === 'REVIEW_QUEUE'
+                    ? 'bg-amber-400/20 border-amber-400 text-amber-200'
+                    : 'bg-slate-800/90 hover:bg-slate-800 border-slate-700 text-white'
+                }`}
+              >
+                <ClipboardCheck className="w-4 h-4 text-amber-400" />
+                <span className="hidden sm:inline">Review queue</span>
+                {pendingCount > 0 && (
+                  <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-rose-500 text-white text-[10px] font-black flex items-center justify-center">
+                    {pendingCount}
+                  </span>
+                )}
+              </button>
+            )}
+
             {user && (
               <button
                 onClick={() => {
@@ -4332,7 +5399,28 @@ export default function UKHalalAppMapbox() {
 
       {/* MAIN CONTENT */}
       <main className="max-w-6xl mx-auto px-4 pt-6 space-y-6">
-        {page === 'MY_REVIEWS' && user ? (
+        {page === 'ADD_PLACE' && user && addLevel !== 'none' ? (
+          <AddPlacePage
+            supabase={supabase}
+            level={addLevel}
+            onBack={() => setPage('HOME')}
+            onAdded={handlePlaceAdded}
+            onChanged={loadAddAccess}
+            onViewOnMap={(lat: number, lng: number) => {
+              setPage('HOME');
+              moveTo(lat, lng, 16);
+            }}
+            setNotice={setNotice}
+          />
+        ) : page === 'REVIEW_QUEUE' && user && addLevel === 'admin' ? (
+          <ReviewQueuePage
+            supabase={supabase}
+            onBack={() => setPage('HOME')}
+            onAdded={handlePlaceAdded}
+            onChanged={loadAddAccess}
+            setNotice={setNotice}
+          />
+        ) : page === 'MY_REVIEWS' && user ? (
           /* ============================ MY REVIEWS PAGE ============================ */
           <div className="space-y-5">
             <div className="flex flex-wrap items-end justify-between gap-3">
