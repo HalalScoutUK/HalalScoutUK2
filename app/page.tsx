@@ -3026,7 +3026,8 @@ function addPlaceError(message: string): string {
     ['not_authenticated', 'Please sign in first.'],
   ];
   for (const [k, v] of table) if (m.includes(k)) return v;
-  return 'Something went wrong. Please try again.';
+  console.error('add place error:', m);
+  return `Something went wrong: ${m.slice(0, 200) || 'unknown error'}`;
 }
 
 async function lookupPostcode(
@@ -3098,6 +3099,147 @@ const FIELD =
   'w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500';
 const LABEL = 'block text-[11px] font-bold uppercase tracking-wide text-slate-400 mb-1';
 
+type PlaceHit = {
+  name: string;
+  address: string;
+  postcode: string;
+  city: string;
+  lat: number;
+  lng: number;
+  full: string;
+};
+
+// Searches Mapbox for a business or address in the UK. permanent=true is
+// Mapbox's rule for results that get saved to a database (billed per request,
+// so it is only used on this admin/scout form, never in the public search).
+async function searchPlacesByName(
+  q: string
+): Promise<{ hits: PlaceHit[]; error: string }> {
+  const token = process.env.NEXT_PUBLIC_MAPBOX_TOKEN;
+  if (!token) return { hits: [], error: 'Map search is not set up.' };
+  const url =
+    'https://api.mapbox.com/search/geocode/v6/forward?' +
+    new URLSearchParams({
+      q,
+      country: 'gb',
+      types: 'poi,address',
+      limit: '6',
+      permanent: 'true',
+      access_token: token,
+    }).toString();
+  try {
+    const res = await fetch(url);
+    if (res.status === 401 || res.status === 403) {
+      return {
+        hits: [],
+        error:
+          'Mapbox has not enabled saved-result search on this account. Use the postcode box instead.',
+      };
+    }
+    if (!res.ok) return { hits: [], error: 'Search failed. Try again.' };
+    const json: any = await res.json();
+    const hits: PlaceHit[] = [];
+    for (const f of (json?.features ?? []) as any[]) {
+      const pr = f?.properties ?? {};
+      const c = pr.coordinates ?? {};
+      const lat = typeof c.latitude === 'number' ? c.latitude : f?.geometry?.coordinates?.[1];
+      const lng = typeof c.longitude === 'number' ? c.longitude : f?.geometry?.coordinates?.[0];
+      if (typeof lat !== 'number' || typeof lng !== 'number') continue;
+      const ctx = pr.context ?? {};
+      hits.push({
+        name: String(pr.name ?? ''),
+        address: String(ctx.address?.name ?? ''),
+        postcode: String(ctx.postcode?.name ?? ''),
+        city: String(ctx.place?.name ?? ctx.locality?.name ?? ''),
+        lat,
+        lng,
+        full: String(pr.full_address ?? pr.place_formatted ?? pr.name ?? ''),
+      });
+    }
+    return { hits, error: '' };
+  } catch {
+    return { hits: [], error: 'Search failed. Check your connection.' };
+  }
+}
+
+function PlaceSearchBox({
+  onPick,
+}: {
+  onPick: (h: PlaceHit) => void;
+}) {
+  const [q, setQ] = useState('');
+  const [hits, setHits] = useState<PlaceHit[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  async function go() {
+    if (q.trim().length < 3 || busy) return;
+    setBusy(true);
+    setErr('');
+    const r = await searchPlacesByName(q.trim());
+    setBusy(false);
+    setHits(r.hits);
+    setErr(r.error);
+  }
+
+  return (
+    <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/5 p-3 space-y-2">
+      <label className={LABEL + ' mb-0'}>Search on the map</label>
+      <div className="flex gap-2">
+        <input
+          className={FIELD}
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              go();
+            }
+          }}
+          placeholder="Restaurant name and town, e.g. Mak Halal Birmingham"
+        />
+        <button
+          type="button"
+          onClick={go}
+          disabled={busy || q.trim().length < 3}
+          className="shrink-0 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white text-xs font-bold"
+        >
+          {busy ? '...' : 'Search'}
+        </button>
+      </div>
+      {err && <p className="text-[11px] text-rose-300">{err}</p>}
+      {hits && !err && hits.length === 0 && (
+        <p className="text-[11px] text-slate-400">
+          Nothing found. Add the town to the search, or fill the form in by hand.
+        </p>
+      )}
+      {hits && hits.length > 0 && (
+        <ul className="space-y-1">
+          {hits.map((h, i) => (
+            <li key={`${h.lat},${h.lng},${i}`}>
+              <button
+                type="button"
+                onClick={() => {
+                  onPick(h);
+                  setHits(null);
+                }}
+                className="w-full text-left rounded-lg border border-slate-700 bg-slate-900 hover:border-emerald-500 px-3 py-2"
+              >
+                <div className="text-sm font-bold text-white">{h.name}</div>
+                <div className="text-[11px] text-slate-400">{h.full}</div>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <p className="text-[11px] text-slate-500">
+        Pick a result to fill in the address, postcode and an exact map pin. Check
+        the details afterwards.
+      </p>
+    </div>
+  );
+}
+
 function PlaceFields({
   form,
   setForm,
@@ -3119,6 +3261,18 @@ function PlaceFields({
   const lngN = toNumOrNull(form.lng);
   return (
     <div className="space-y-4">
+      <PlaceSearchBox
+        onPick={(h) =>
+          set({
+            name: form.name.trim() ? form.name : h.name,
+            address: h.address || form.address,
+            postcode: h.postcode ? h.postcode.toUpperCase() : form.postcode,
+            city: h.city || form.city,
+            lat: h.lat.toFixed(6),
+            lng: h.lng.toFixed(6),
+          })
+        }
+      />
       <div>
         <label className={LABEL}>Restaurant name</label>
         <input
