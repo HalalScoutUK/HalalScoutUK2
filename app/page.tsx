@@ -2998,7 +2998,7 @@ function addPlaceError(message: string): string {
     ['invalid_postcode', 'That does not look like a UK postcode.'],
     [
       'invalid_location',
-      'The map pin is outside the UK. Check the postcode and coordinates.',
+      'The pin is outside the UK. Check the postcode and move the pin onto the restaurant.',
     ],
     ['invalid_phone', 'Phone numbers can only use digits, spaces, + ( ) and -.'],
     ['invalid_website', 'The website must start with http:// or https://'],
@@ -3098,6 +3098,196 @@ const FIELD =
   'w-full bg-slate-900 border border-slate-700 rounded-xl px-3 py-2 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500';
 const LABEL = 'block text-[11px] font-bold uppercase tracking-wide text-slate-400 mb-1';
 
+function PinPicker({
+  lat,
+  lng,
+  onChange,
+}: {
+  lat: number | null;
+  lng: number | null;
+  onChange: (lat: number, lng: number) => void;
+}) {
+  const mapRef = useRef<any>(null);
+  const internal = useRef(false);
+  const fromGps = useRef(false);
+  const [satellite, setSatellite] = useState(true);
+  const [locMsg, setLocMsg] = useState('');
+  // ask: "is the pin on the restaurant?"  moving: they are adjusting it
+  // done: they said it is right
+  const [mode, setMode] = useState<'ask' | 'moving' | 'done'>('ask');
+  const hasPin = lat != null && lng != null;
+
+  useEffect(() => {
+    if (internal.current) {
+      internal.current = false;
+      setMode('moving');
+      return;
+    }
+    if (fromGps.current) {
+      fromGps.current = false;
+      setMode('done');
+    } else {
+      setMode('ask');
+    }
+    if (lat != null && lng != null && mapRef.current) {
+      mapRef.current.flyTo({ center: [lng, lat], zoom: 17, duration: 900 });
+    }
+  }, [lat, lng]);
+
+  function place(la: number, ln: number) {
+    internal.current = true;
+    onChange(Number(la.toFixed(6)), Number(ln.toFixed(6)));
+  }
+
+  function useMyLocation() {
+    setLocMsg('');
+    if (!navigator.geolocation) {
+      setLocMsg('Your device cannot share its location.');
+      return;
+    }
+    setLocMsg('Finding you...');
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        fromGps.current = true;
+        onChange(
+          Number(pos.coords.latitude.toFixed(6)),
+          Number(pos.coords.longitude.toFixed(6))
+        );
+        setLocMsg('');
+      },
+      () =>
+        setLocMsg(
+          'Could not get your location. Allow location access in your browser and try again.'
+        ),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <button
+        type="button"
+        onClick={useMyLocation}
+        className="w-full flex items-center justify-center gap-2 text-sm font-black text-slate-950 bg-emerald-500 hover:bg-emerald-400 rounded-xl px-3 py-2.5"
+      >
+        <Crosshair className="w-4 h-4" /> I am at the restaurant right now
+      </button>
+      {locMsg && <p className="text-[11px] text-slate-400">{locMsg}</p>}
+
+      <div className="relative h-64 sm:h-72 rounded-xl overflow-hidden border border-slate-700">
+        <Map
+          ref={mapRef}
+          initialViewState={
+            hasPin
+              ? { latitude: lat as number, longitude: lng as number, zoom: 17 }
+              : { latitude: 53.5, longitude: -2.5, zoom: 5 }
+          }
+          style={{ width: '100%', height: '100%' }}
+          mapStyle={
+            satellite
+              ? 'mapbox://styles/mapbox/satellite-streets-v12'
+              : 'mapbox://styles/mapbox/streets-v12'
+          }
+          mapboxAccessToken={process.env.NEXT_PUBLIC_MAPBOX_TOKEN}
+          onClick={(e: any) => place(e.lngLat.lat, e.lngLat.lng)}
+          cursor="crosshair"
+        >
+          {hasPin && (
+            <Marker
+              latitude={lat as number}
+              longitude={lng as number}
+              anchor="bottom"
+              draggable
+              onDragEnd={(e: any) => place(e.lngLat.lat, e.lngLat.lng)}
+            >
+              <MapPin
+                className="w-9 h-9 text-rose-500 drop-shadow-lg"
+                fill="currentColor"
+                stroke="white"
+                strokeWidth={1.5}
+              />
+            </Marker>
+          )}
+        </Map>
+        <div className="absolute top-2 right-2 flex bg-slate-900/90 border border-slate-700 rounded-lg overflow-hidden text-[11px] font-bold">
+          <button
+            type="button"
+            onClick={() => setSatellite(false)}
+            className={`px-2.5 py-1 ${!satellite ? 'bg-emerald-500 text-slate-950' : 'text-slate-300'}`}
+          >
+            Map
+          </button>
+          <button
+            type="button"
+            onClick={() => setSatellite(true)}
+            className={`px-2.5 py-1 ${satellite ? 'bg-emerald-500 text-slate-950' : 'text-slate-300'}`}
+          >
+            Satellite
+          </button>
+        </div>
+      </div>
+
+      {!hasPin ? (
+        <p className="text-xs text-slate-400">
+          Type the postcode above and the pin will appear here. If you are at the
+          restaurant, use the green button instead.
+        </p>
+      ) : mode === 'ask' ? (
+        <div className="rounded-xl border border-amber-400/40 bg-amber-400/10 p-3 space-y-2">
+          <p className="text-sm font-bold text-white">
+            Is the pin on the restaurant?
+          </p>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => setMode('done')}
+              className="flex-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black rounded-lg py-2 text-sm"
+            >
+              Yes
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('moving')}
+              className="flex-1 border border-slate-500 text-slate-200 hover:bg-slate-700/50 font-bold rounded-lg py-2 text-sm"
+            >
+              Not quite
+            </button>
+          </div>
+          <p className="text-[11px] text-slate-400">
+            Not sure? That is fine. Leave it and an admin will check the spot.
+          </p>
+        </div>
+      ) : mode === 'moving' ? (
+        <div className="rounded-xl border border-slate-600 bg-slate-900/70 p-3 space-y-2">
+          <p className="text-sm text-slate-200">
+            Tap the map or drag the pin onto the restaurant&rsquo;s front door.
+          </p>
+          <button
+            type="button"
+            onClick={() => setMode('done')}
+            className="w-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black rounded-lg py-2 text-sm"
+          >
+            Done
+          </button>
+        </div>
+      ) : (
+        <div className="flex items-center justify-between rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3 py-2">
+          <span className="text-sm font-bold text-emerald-300">
+            Pin is set
+          </span>
+          <button
+            type="button"
+            onClick={() => setMode('moving')}
+            className="text-xs text-slate-300 underline hover:text-white"
+          >
+            Move it
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PlaceFields({
   form,
   setForm,
@@ -3105,6 +3295,7 @@ function PlaceFields({
   onLookup,
   looking,
   lookupMsg,
+  showPin = true,
 }: {
   form: PlaceForm;
   setForm: (f: PlaceForm) => void;
@@ -3112,6 +3303,7 @@ function PlaceFields({
   onLookup: () => void;
   looking: boolean;
   lookupMsg: string;
+  showPin?: boolean;
 }) {
   const set = (patch: Partial<PlaceForm>) => setForm({ ...form, ...patch });
   const certified = form.category !== 'HALAL_OPTIONS';
@@ -3139,6 +3331,13 @@ function PlaceFields({
               value={form.postcode}
               maxLength={9}
               onChange={(e) => set({ postcode: e.target.value.toUpperCase() })}
+              onBlur={() => {
+                if (
+                  toNumOrNull(form.lat) == null &&
+                  form.postcode.replace(/\s+/g, '').length >= 5
+                )
+                  onLookup();
+              }}
               placeholder="B10 9SN"
             />
             <button
@@ -3200,42 +3399,18 @@ function PlaceFields({
         </div>
       </div>
 
-      <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-3 space-y-2">
-        <div className="flex items-center justify-between gap-2">
-          <span className={LABEL + ' mb-0'}>Map pin</span>
-          {latN != null && lngN != null && (
-            <a
-              href={`https://www.google.com/maps?q=${latN},${lngN}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-[11px] text-emerald-400 hover:underline"
-            >
-              Check on Google Maps
-            </a>
-          )}
-        </div>
-        <div className="grid grid-cols-2 gap-3">
-          <input
-            className={FIELD}
-            value={form.lat}
-            inputMode="decimal"
-            onChange={(e) => set({ lat: e.target.value })}
-            placeholder="Latitude"
-          />
-          <input
-            className={FIELD}
-            value={form.lng}
-            inputMode="decimal"
-            onChange={(e) => set({ lng: e.target.value })}
-            placeholder="Longitude"
+      {showPin && (
+        <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-3 space-y-2">
+          <span className={LABEL + ' mb-0'}>Where is it?</span>
+          <PinPicker
+            lat={latN}
+            lng={lngN}
+            onChange={(la, ln) =>
+              set({ lat: la.toFixed(6), lng: ln.toFixed(6) })
+            }
           />
         </div>
-        <p className="text-[11px] text-slate-500">
-          &ldquo;Find&rdquo; puts the pin at the middle of the postcode, which can be
-          a street or two out. To be exact, right-click the shop in Google Maps,
-          copy the two numbers and paste them here.
-        </p>
-      </div>
+      )}
 
       <div>
         <label className={LABEL}>Halal status</label>
@@ -3399,7 +3574,7 @@ function AddPlacePage({
       const r = await lookupPostcode(f.postcode);
       setBusy(false);
       if (!r) {
-        setError('Add the map pin: press Find next to the postcode, or enter the coordinates.');
+        setError('Enter a valid postcode so we can place the pin, or use the green "I am at the restaurant" button.');
         return;
       }
       f = {
@@ -3413,7 +3588,7 @@ function AddPlacePage({
     const lat = toNumOrNull(f.lat);
     const lng = toNumOrNull(f.lng);
     if (lat == null || lng == null) {
-      setError('The map pin numbers are not valid.');
+      setError('Please place the pin on the map.');
       return;
     }
     const certified = f.category !== 'HALAL_OPTIONS';
@@ -3656,7 +3831,7 @@ function QueueCard({
     const lat = toNumOrNull(form.lat);
     const lng = toNumOrNull(form.lng);
     if (lat == null || lng == null) {
-      setError('The map pin numbers are not valid.');
+      setError('Please place the pin on the map.');
       return;
     }
     const certified = form.category !== 'HALAL_OPTIONS';
@@ -3753,6 +3928,19 @@ function QueueCard({
         )}
       </div>
 
+      <div className="rounded-xl border border-slate-700 bg-slate-900/60 p-3 space-y-2">
+        <span className={LABEL + ' mb-0'}>
+          Check the pin (scouts may have left it at the postcode)
+        </span>
+        <PinPicker
+          lat={toNumOrNull(form.lat)}
+          lng={toNumOrNull(form.lng)}
+          onChange={(la, ln) =>
+            setForm({ ...form, lat: la.toFixed(6), lng: ln.toFixed(6) })
+          }
+        />
+      </div>
+
       <div className="flex flex-wrap gap-3 text-xs">
         <a
           href={`https://www.google.com/maps?q=${encodeURIComponent(
@@ -3779,6 +3967,7 @@ function QueueCard({
             form={form}
             setForm={setForm}
             showNote={false}
+            showPin={false}
             onLookup={doLookup}
             looking={looking}
             lookupMsg={lookupMsg}
