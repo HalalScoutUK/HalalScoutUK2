@@ -4172,6 +4172,7 @@ const COMMUNITY_CATEGORIES: { key: string; label: string; emoji: string; cls: st
   { key: 'warning', label: 'Heads up', emoji: '⚠️', cls: 'bg-rose-500/15 text-rose-300 border-rose-500/40' },
   { key: 'new_opening', label: 'New opening', emoji: '🆕', cls: 'bg-violet-500/15 text-violet-300 border-violet-500/40' },
   { key: 'general', label: 'General', emoji: '💬', cls: 'bg-slate-500/20 text-slate-200 border-slate-500/40' },
+  { key: 'offer', label: 'Offer', emoji: '🏷️', cls: 'bg-amber-400/20 text-amber-200 border-amber-400/50' },
 ];
 
 const COMMUNITY_TIERS: Record<string, { label: string; cls: string }> = {
@@ -4179,6 +4180,7 @@ const COMMUNITY_TIERS: Record<string, { label: string; cls: string }> = {
   silver: { label: '🥈 Silver', cls: 'bg-slate-300/20 text-slate-200 border-slate-400/40' },
   gold: { label: '🥇 Gold', cls: 'bg-amber-400/20 text-amber-300 border-amber-400/40' },
   trusted: { label: '⭐ Trusted', cls: 'bg-amber-400/20 text-amber-300 border-amber-400/40' },
+  owner: { label: '🏪 Owner', cls: 'bg-amber-400/20 text-amber-200 border-amber-400/50' },
 };
 
 const COMMUNITY_MAX_VIDEO_SECONDS = 10;
@@ -4186,7 +4188,12 @@ const COMMUNITY_MAX_VIDEO_MB = 80;
 const COMMUNITY_BUCKET = 'community-media';
 const COMMUNITY_PAGE_SIZE = 20;
 
-type CommunityAccess = { canPost: boolean; tier: string; displayName: string };
+type CommunityAccess = {
+  canPost: boolean;
+  canOffer: boolean;
+  tier: string;
+  displayName: string;
+};
 
 function communityError(message: string): string {
   const m = message || '';
@@ -4199,6 +4206,9 @@ function communityError(message: string): string {
     ['no_links', 'Links and repeated characters are not allowed.'],
     ['invalid_city', 'That town or city does not look right.'],
     ['invalid_category', 'Choose a category.'],
+    ['offer_requires_owner', 'Only the verified owner of a restaurant can post an offer for it.'],
+    ['offer_needs_restaurant', 'Choose which restaurant this offer is for.'],
+    ['invalid_offer_date', 'The offer end date must be in the future (within a year).'],
     ['restaurant_not_available', 'That restaurant is not currently listed.'],
     ['too_many_photos', 'You can add up to 3 photos.'],
     ['photo_not_found', 'A photo did not upload properly. Please try again.'],
@@ -4346,18 +4356,32 @@ function PostComposer({
   supabase,
   userId,
   restaurants,
+  ownedRestaurants,
+  access,
+  onClose,
   onPosted,
   setNotice,
 }: {
   supabase: any;
   userId: string;
   restaurants: any[];
+  ownedRestaurants: any[];
+  access: CommunityAccess;
+  onClose: () => void;
   onPosted: () => void;
   setNotice: (s: string) => void;
 }) {
-  const [category, setCategory] = useState('recommendation');
+  // Members choose from everything except offers; owners can also post offers
+  const choices = COMMUNITY_CATEGORIES.filter((c) =>
+    c.key === 'offer' ? access.canOffer : access.canPost
+  );
+  const [category, setCategory] = useState(choices[0]?.key ?? 'general');
   const [city, setCity] = useState('');
   const [tagged, setTagged] = useState<{ id: number; name: string } | null>(null);
+  const [offerRestaurant, setOfferRestaurant] = useState<string>(
+    ownedRestaurants[0] ? String(ownedRestaurants[0].id) : ''
+  );
+  const [validUntil, setValidUntil] = useState('');
   const [search, setSearch] = useState('');
   const [body, setBody] = useState('');
   const [photos, setPhotos] = useState<{ file: File; url: string }[]>([]);
@@ -4367,6 +4391,20 @@ function PostComposer({
   const [error, setError] = useState('');
   const photoInput = useRef<HTMLInputElement>(null);
   const videoInput = useRef<HTMLInputElement>(null);
+  const isOffer = category === 'offer';
+
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !busy) onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => {
+      document.body.style.overflow = prev;
+      window.removeEventListener('keydown', onKey);
+    };
+  }, [busy, onClose]);
 
   const cities = useMemo(() => {
     const set = new Set<string>();
@@ -4430,6 +4468,10 @@ function PostComposer({
       setError('Write a little more (at least 3 characters).');
       return;
     }
+    if (isOffer && !offerRestaurant) {
+      setError('Choose which restaurant this offer is for.');
+      return;
+    }
     setBusy(true);
     const uploaded: string[] = [];
     let videoId: string | null = null;
@@ -4448,228 +4490,296 @@ function PostComposer({
       setProgress('Posting...');
       const { error: postErr } = await supabase.rpc('create_community_post', {
         p_category: category,
-        p_city: city,
-        p_restaurant_id: tagged?.id ?? null,
+        p_city: isOffer ? '' : city,
+        p_restaurant_id: isOffer ? Number(offerRestaurant) : tagged?.id ?? null,
         p_body: body,
         p_photo_paths: uploaded,
         p_video_id: videoId,
+        p_offer_valid_until: isOffer && validUntil ? validUntil : null,
       });
       if (postErr) throw postErr;
       photos.forEach((p) => URL.revokeObjectURL(p.url));
       if (video) URL.revokeObjectURL(video.url);
-      setPhotos([]);
-      setVideo(null);
-      setBody('');
-      setTagged(null);
-      setSearch('');
-      setNotice('Posted!');
+      setNotice(isOffer ? 'Your offer is live!' : 'Posted!');
       onPosted();
     } catch (e: any) {
       if (uploaded.length) void supabase.storage.from(COMMUNITY_BUCKET).remove(uploaded);
       if (videoId)
         void supabase.functions.invoke('community-video', { body: { action: 'delete', videoId } });
       setError(communityError(String(e?.message ?? e ?? '')));
-    } finally {
       setBusy(false);
       setProgress('');
     }
   }
 
-  return (
-    <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-4 space-y-3">
-      <h3 className="text-sm font-black text-white">Start a post</h3>
-
-      <div className="flex flex-wrap gap-1.5">
-        {COMMUNITY_CATEGORIES.map((c) => (
+  return createPortal(
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center">
+      <div
+        className="absolute inset-0 bg-slate-950/70 backdrop-blur-sm"
+        onClick={() => {
+          if (!busy) onClose();
+        }}
+      />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="New post"
+        className="relative w-full sm:max-w-lg max-h-[92vh] overflow-y-auto bg-slate-900 border border-slate-700 rounded-t-3xl sm:rounded-3xl shadow-2xl p-4 sm:p-5 space-y-3"
+      >
+        <div className="flex items-center justify-between">
+          <h3 className="text-base font-black text-white">New post</h3>
           <button
             type="button"
-            key={c.key}
-            onClick={() => setCategory(c.key)}
-            className={`text-xs font-bold px-2.5 py-1 rounded-full border transition ${
-              category === c.key ? c.cls : 'border-slate-700 text-slate-400 hover:text-white'
-            }`}
+            aria-label="Close"
+            disabled={busy}
+            onClick={onClose}
+            className="p-1.5 rounded-full hover:bg-slate-800 text-slate-300 disabled:opacity-40"
           >
-            {c.emoji} {c.label}
+            <X className="w-5 h-5" />
           </button>
-        ))}
-      </div>
+        </div>
 
-      <textarea
-        className={FIELD + ' min-h-[96px]'}
-        value={body}
-        maxLength={1000}
-        onChange={(e) => setBody(e.target.value)}
-        placeholder="What do you want to share with other scouts?"
-      />
-      <div className="flex justify-between text-[11px] text-slate-500 -mt-2">
-        <span>No links, please.</span>
-        <span>{body.length}/1000</span>
-      </div>
-
-      {(photos.length > 0 || video) && (
-        <div className="flex flex-wrap gap-2">
-          {photos.map((p, i) => (
-            <div key={p.url} className="relative">
-              <img src={p.url} alt="" className="w-20 h-20 object-cover rounded-lg border border-slate-700" />
-              <button
-                type="button"
-                aria-label="Remove photo"
-                onClick={() => {
-                  URL.revokeObjectURL(p.url);
-                  setPhotos(photos.filter((_, j) => j !== i));
-                }}
-                className="absolute -top-1.5 -right-1.5 bg-slate-900 border border-slate-600 rounded-full p-0.5"
-              >
-                <X className="w-3 h-3 text-white" />
-              </button>
-            </div>
+        <div className="flex flex-wrap gap-1.5">
+          {choices.map((c) => (
+            <button
+              type="button"
+              key={c.key}
+              onClick={() => setCategory(c.key)}
+              className={`text-xs font-bold px-2.5 py-1 rounded-full border transition ${
+                category === c.key ? c.cls : 'border-slate-700 text-slate-400 hover:text-white'
+              }`}
+            >
+              {c.emoji} {c.label}
+            </button>
           ))}
-          {video && (
-            <div className="relative">
-              <video src={`${video.url}#t=0.1`} muted playsInline className="w-20 h-20 object-cover rounded-lg border border-slate-700" />
-              <span className="absolute bottom-1 left-1 text-[9px] font-bold bg-slate-900/80 text-white px-1 rounded">VIDEO</span>
-              <button
-                type="button"
-                aria-label="Remove video"
-                onClick={() => {
-                  URL.revokeObjectURL(video.url);
-                  setVideo(null);
-                }}
-                className="absolute -top-1.5 -right-1.5 bg-slate-900 border border-slate-600 rounded-full p-0.5"
-              >
-                <X className="w-3 h-3 text-white" />
-              </button>
-            </div>
-          )}
         </div>
-      )}
 
-      <div className="flex flex-wrap gap-2">
-        <input
-          ref={photoInput}
-          type="file"
-          accept="image/jpeg,image/png,image/webp"
-          multiple
-          hidden
-          onChange={(e) => {
-            addPhotos(e.target.files);
-            e.target.value = '';
-          }}
-        />
-        <input
-          ref={videoInput}
-          type="file"
-          accept="video/*"
-          hidden
-          onChange={(e) => {
-            void pickVideo(e.target.files);
-            e.target.value = '';
-          }}
-        />
-        <button
-          type="button"
-          disabled={photos.length >= 3 || busy}
-          onClick={() => photoInput.current?.click()}
-          className="flex items-center gap-1.5 text-xs font-bold border border-slate-600 text-slate-200 hover:bg-slate-700/50 disabled:opacity-40 rounded-lg px-3 py-1.5"
-        >
-          <ImageIcon className="w-3.5 h-3.5" /> Photo ({photos.length}/3)
-        </button>
-        <button
-          type="button"
-          disabled={!!video || busy}
-          onClick={() => videoInput.current?.click()}
-          className="flex items-center gap-1.5 text-xs font-bold border border-slate-600 text-slate-200 hover:bg-slate-700/50 disabled:opacity-40 rounded-lg px-3 py-1.5"
-        >
-          <Play className="w-3.5 h-3.5" /> Video ({COMMUNITY_MAX_VIDEO_SECONDS}s max)
-        </button>
-      </div>
+        {isOffer && (
+          <div className="rounded-xl border border-amber-400/40 bg-amber-400/10 p-3 space-y-3">
+            <p className="text-[11px] text-amber-200">
+              Offers appear with your restaurant&rsquo;s name and an Owner badge, and
+              disappear from the feed after the end date.
+            </p>
+            <div className="grid sm:grid-cols-2 gap-3">
+              <div>
+                <label className={LABEL}>Restaurant</label>
+                <select
+                  className={FIELD}
+                  value={offerRestaurant}
+                  onChange={(e) => setOfferRestaurant(e.target.value)}
+                >
+                  {ownedRestaurants.map((r: any) => (
+                    <option key={r.id} value={String(r.id)}>
+                      {r.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className={LABEL}>Offer ends (optional)</label>
+                <input
+                  type="date"
+                  className={FIELD}
+                  value={validUntil}
+                  min={new Date().toISOString().slice(0, 10)}
+                  onChange={(e) => setValidUntil(e.target.value)}
+                />
+              </div>
+            </div>
+          </div>
+        )}
 
-      <div className="grid sm:grid-cols-2 gap-3">
-        <div>
-          <label className={LABEL}>Town or city (optional)</label>
-          <input
-            className={FIELD}
-            list="community-cities"
-            value={city}
-            maxLength={60}
-            onChange={(e) => setCity(e.target.value)}
-            placeholder="e.g. Birmingham"
-          />
-          <datalist id="community-cities">
-            {cities.map((c) => (
-              <option key={c} value={c} />
+        <textarea
+          className={FIELD + ' min-h-[110px]'}
+          value={body}
+          maxLength={1000}
+          onChange={(e) => setBody(e.target.value)}
+          placeholder={
+            isOffer
+              ? 'e.g. 20% off all grills this weekend. Just mention Halal Scout at the till.'
+              : 'What do you want to share with other scouts?'
+          }
+        />
+        <div className="flex justify-between text-[11px] text-slate-500 -mt-2">
+          <span>No links, please.</span>
+          <span>{body.length}/1000</span>
+        </div>
+
+        {(photos.length > 0 || video) && (
+          <div className="flex flex-wrap gap-2">
+            {photos.map((p, i) => (
+              <div key={p.url} className="relative">
+                <img src={p.url} alt="" className="w-20 h-20 object-cover rounded-lg border border-slate-700" />
+                <button
+                  type="button"
+                  aria-label="Remove photo"
+                  onClick={() => {
+                    URL.revokeObjectURL(p.url);
+                    setPhotos(photos.filter((_, j) => j !== i));
+                  }}
+                  className="absolute -top-1.5 -right-1.5 bg-slate-900 border border-slate-600 rounded-full p-0.5"
+                >
+                  <X className="w-3 h-3 text-white" />
+                </button>
+              </div>
             ))}
-          </datalist>
+            {video && (
+              <div className="relative">
+                <video src={`${video.url}#t=0.1`} muted playsInline className="w-20 h-20 object-cover rounded-lg border border-slate-700" />
+                <span className="absolute bottom-1 left-1 text-[9px] font-bold bg-slate-900/80 text-white px-1 rounded">VIDEO</span>
+                <button
+                  type="button"
+                  aria-label="Remove video"
+                  onClick={() => {
+                    URL.revokeObjectURL(video.url);
+                    setVideo(null);
+                  }}
+                  className="absolute -top-1.5 -right-1.5 bg-slate-900 border border-slate-600 rounded-full p-0.5"
+                >
+                  <X className="w-3 h-3 text-white" />
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="flex flex-wrap gap-2">
+          <input
+            ref={photoInput}
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            multiple
+            hidden
+            onChange={(e) => {
+              addPhotos(e.target.files);
+              e.target.value = '';
+            }}
+          />
+          <input
+            ref={videoInput}
+            type="file"
+            accept="video/*"
+            hidden
+            onChange={(e) => {
+              void pickVideo(e.target.files);
+              e.target.value = '';
+            }}
+          />
+          <button
+            type="button"
+            disabled={photos.length >= 3 || busy}
+            onClick={() => photoInput.current?.click()}
+            className="flex items-center gap-1.5 text-xs font-bold border border-slate-600 text-slate-200 hover:bg-slate-700/50 disabled:opacity-40 rounded-lg px-3 py-1.5"
+          >
+            <ImageIcon className="w-3.5 h-3.5" /> Photo ({photos.length}/3)
+          </button>
+          <button
+            type="button"
+            disabled={!!video || busy}
+            onClick={() => videoInput.current?.click()}
+            className="flex items-center gap-1.5 text-xs font-bold border border-slate-600 text-slate-200 hover:bg-slate-700/50 disabled:opacity-40 rounded-lg px-3 py-1.5"
+          >
+            <Play className="w-3.5 h-3.5" /> Video ({COMMUNITY_MAX_VIDEO_SECONDS}s max)
+          </button>
         </div>
-        <div className="relative">
-          <label className={LABEL}>Tag a restaurant (optional)</label>
-          {tagged ? (
-            <div className="flex items-center justify-between bg-slate-900 border border-emerald-500/40 rounded-xl px-3 py-2 text-sm text-white">
-              <span className="truncate">{tagged.name}</span>
-              <button
-                type="button"
-                aria-label="Remove tag"
-                onClick={() => setTagged(null)}
-                className="ml-2 text-slate-400 hover:text-white"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-          ) : (
-            <>
+
+        {!isOffer && (
+          <div className="grid sm:grid-cols-2 gap-3">
+            <div>
+              <label className={LABEL}>Town or city (optional)</label>
               <input
                 className={FIELD}
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="Start typing a name"
+                list="community-cities"
+                value={city}
+                maxLength={60}
+                onChange={(e) => setCity(e.target.value)}
+                placeholder="e.g. Birmingham"
               />
-              {matches.length > 0 && (
-                <ul className="absolute z-20 mt-1 w-full bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-xl">
-                  {matches.map((r: any) => (
-                    <li key={r.id}>
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setTagged({ id: r.id, name: r.name });
-                          setSearch('');
-                          if (!city.trim() && r.city) setCity(String(r.city));
-                        }}
-                        className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-800"
-                      >
-                        {r.name}
-                        <span className="text-[11px] text-slate-400">
-                          {r.city ? `  ${r.city}` : ''}
-                        </span>
-                      </button>
-                    </li>
-                  ))}
-                </ul>
+              <datalist id="community-cities">
+                {cities.map((c) => (
+                  <option key={c} value={c} />
+                ))}
+              </datalist>
+            </div>
+            <div className="relative">
+              <label className={LABEL}>Tag a restaurant (optional)</label>
+              {tagged ? (
+                <div className="flex items-center justify-between bg-slate-900 border border-emerald-500/40 rounded-xl px-3 py-2 text-sm text-white">
+                  <span className="truncate">{tagged.name}</span>
+                  <button
+                    type="button"
+                    aria-label="Remove tag"
+                    onClick={() => setTagged(null)}
+                    className="ml-2 text-slate-400 hover:text-white"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <input
+                    className={FIELD}
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                    placeholder="Start typing a name"
+                  />
+                  {matches.length > 0 && (
+                    <ul className="absolute z-20 mt-1 w-full bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-xl">
+                      {matches.map((r: any) => (
+                        <li key={r.id}>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setTagged({ id: r.id, name: r.name });
+                              setSearch('');
+                              if (!city.trim() && r.city) setCity(String(r.city));
+                            }}
+                            className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-800"
+                          >
+                            {r.name}
+                            <span className="text-[11px] text-slate-400">
+                              {r.city ? `  ${r.city}` : ''}
+                            </span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </>
               )}
-            </>
-          )}
-        </div>
-      </div>
+            </div>
+          </div>
+        )}
 
-      {error && (
-        <p className="text-sm text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-xl px-3 py-2">
-          {error}
-        </p>
-      )}
-      <button
-        type="button"
-        onClick={submit}
-        disabled={busy}
-        className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-black rounded-xl py-2.5 text-sm"
-      >
-        {busy ? progress || 'Working...' : 'Post'}
-      </button>
-    </div>
+        {error && (
+          <p className="text-sm text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-xl px-3 py-2">
+            {error}
+          </p>
+        )}
+        <button
+          type="button"
+          onClick={submit}
+          disabled={busy}
+          className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-black rounded-xl py-2.5 text-sm"
+        >
+          {busy ? progress || 'Working...' : isOffer ? 'Publish offer' : 'Post'}
+        </button>
+      </div>
+    </div>,
+    document.body
   );
+}
+
+function agoText(iso: string) {
+  const t = timeAgoShort(iso);
+  if (t === 'now') return 'Just now';
+  return /^\d+[mhd]$/.test(t) ? `${t} ago` : t;
 }
 
 function PostCard({
   post,
   photoUrls,
+  distanceMiles,
   supabase,
   isAdmin,
   onOpenRestaurant,
@@ -4678,6 +4788,7 @@ function PostCard({
 }: {
   post: any;
   photoUrls: Record<string, string>;
+  distanceMiles: number | null;
   supabase: any;
   isAdmin: boolean;
   onOpenRestaurant: (id: number) => void;
@@ -4688,10 +4799,14 @@ function PostCard({
   const [likes, setLikes] = useState<number>(Number(post.like_count || 0));
   const [commentCount, setCommentCount] = useState<number>(Number(post.comment_count || 0));
   const [open, setOpen] = useState(false);
+  const [menu, setMenu] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const [comments, setComments] = useState<any[] | null>(null);
   const [commentsError, setCommentsError] = useState(false);
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
+  const isOffer = post.category === 'offer';
+  const longBody = String(post.body ?? '').length > 180 || String(post.body ?? '').split('\n').length > 3;
 
   const items: MediaItem[] = [];
   (Array.isArray(post.media) ? post.media : []).forEach((m: any) => {
@@ -4700,6 +4815,12 @@ function PostCard({
     else if (m?.type === 'video' && typeof m.url === 'string')
       items.push({ src: m.url, type: 'video' });
   });
+
+  let offerLine = '';
+  if (isOffer && post.offer_valid_until) {
+    const d = parseDateOnly(String(post.offer_valid_until));
+    offerLine = `Offer ends ${formatDate(d)}`;
+  }
 
   async function loadComments() {
     const { data, error } = await supabase.rpc('get_community_comments', {
@@ -4726,9 +4847,7 @@ function PostCard({
       setNotice(communityError(error.message));
       return;
     }
-    if (data !== !was) {
-      setLiked(data === true);
-    }
+    if (data !== !was) setLiked(data === true);
   }
 
   async function sendComment() {
@@ -4790,28 +4909,83 @@ function PostCard({
   }
 
   return (
-    <article className="bg-slate-800/60 border border-slate-700 rounded-2xl p-4 space-y-3">
-      <header className="flex flex-wrap items-center gap-2">
-        <span className="text-sm font-black text-white">{post.display_name}</span>
+    <article
+      className={`bg-slate-800/60 border rounded-2xl overflow-hidden ${
+        isOffer ? 'border-amber-400/50' : 'border-slate-700'
+      }`}
+    >
+      <header className="flex items-center gap-2 px-4 pt-3 pb-2">
+        {isOffer && <Store className="w-4 h-4 text-amber-300 shrink-0" />}
+        <span className="text-sm font-black text-white truncate">{post.display_name}</span>
         <TierPill tier={post.author_tier} />
         {post.is_mine && <span className="text-[10px] text-emerald-300 font-bold">You</span>}
-        <span className="text-[11px] text-slate-500">{timeAgoShort(post.created_at)}</span>
-        <span className="ml-auto flex items-center gap-1.5">
-          <CategoryPill cat={post.category} />
-        </span>
+        <div className="ml-auto relative">
+          <button
+            type="button"
+            aria-label="More options"
+            aria-expanded={menu}
+            onClick={() => setMenu(!menu)}
+            className="px-2 py-1 text-slate-400 hover:text-white text-lg leading-none tracking-widest"
+          >
+            &middot;&middot;&middot;
+          </button>
+          {menu && (
+            <div className="absolute right-0 top-full z-20 w-44 bg-slate-900 border border-slate-700 rounded-xl p-3 space-y-3 shadow-xl">
+              {post.is_mine ? (
+                <ConfirmButton
+                  label="Delete post"
+                  confirmLabel="Yes, delete"
+                  danger
+                  onConfirm={() => {
+                    setMenu(false);
+                    void deletePost();
+                  }}
+                  icon={<Trash2 className="w-3 h-3" />}
+                />
+              ) : (
+                <ConfirmButton
+                  label="Report post"
+                  confirmLabel="Yes, report"
+                  onConfirm={() => {
+                    setMenu(false);
+                    void report('post', post.id);
+                  }}
+                  icon={<Flag className="w-3 h-3" />}
+                />
+              )}
+              {isAdmin && !post.is_mine && (
+                <ConfirmButton
+                  label="Remove (admin)"
+                  confirmLabel="Yes, remove"
+                  danger
+                  onConfirm={() => {
+                    setMenu(false);
+                    void adminRemove();
+                  }}
+                  icon={<Trash2 className="w-3 h-3" />}
+                />
+              )}
+              <button
+                type="button"
+                onClick={() => setMenu(false)}
+                className="text-[11px] text-slate-500 hover:text-slate-300"
+              >
+                Close
+              </button>
+            </div>
+          )}
+        </div>
       </header>
 
-      <p className="text-sm text-slate-100 whitespace-pre-wrap break-words">{post.body}</p>
-
       {items.length > 0 && (
-        <div className={items.length === 1 ? '' : 'grid grid-cols-2 gap-2'}>
+        <div className={items.length === 1 ? '' : 'grid grid-cols-2 gap-0.5'}>
           {items.map((it, i) => (
             <ViewableMedia
               key={`${it.src}-${i}`}
               items={items}
               index={i}
               caption={post.body}
-              className={`block w-full overflow-hidden rounded-xl bg-slate-900 ${
+              className={`block w-full overflow-hidden bg-slate-900 ${
                 items.length === 1 ? 'aspect-video' : 'aspect-square'
               }`}
             >
@@ -4821,27 +4995,73 @@ function PostCard({
         </div>
       )}
 
-      {(post.restaurant_id || post.city) && (
-        <div className="flex flex-wrap items-center gap-2 text-[11px]">
-          {post.restaurant_id && post.restaurant_name && (
+      <div className="px-4 pt-3 space-y-2">
+        <div className="flex flex-wrap items-center gap-x-2 text-[11px] text-slate-400">
+          <span>{agoText(post.created_at)}</span>
+          {post.city && <span>&middot; {post.city}</span>}
+          {distanceMiles != null && (
+            <span>&middot; {distanceMiles < 10 ? distanceMiles.toFixed(1) : Math.round(distanceMiles)} mi</span>
+          )}
+        </div>
+
+        {offerLine && (
+          <p className="text-xs font-bold text-amber-300">{offerLine}</p>
+        )}
+
+        <p
+          className="text-sm text-slate-100 whitespace-pre-wrap break-words"
+          style={
+            expanded || !longBody
+              ? undefined
+              : {
+                  display: '-webkit-box',
+                  WebkitLineClamp: 3,
+                  WebkitBoxOrient: 'vertical',
+                  overflow: 'hidden',
+                }
+          }
+        >
+          {post.body}
+        </p>
+        {longBody && (
+          <button
+            type="button"
+            onClick={() => setExpanded(!expanded)}
+            className="text-xs font-bold text-emerald-400 hover:underline"
+          >
+            {expanded ? 'Show less' : 'Read more'}
+          </button>
+        )}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <CategoryPill cat={post.category} />
+          {post.restaurant_id && post.restaurant_name && !isOffer && (
             <button
               type="button"
               onClick={() => onOpenRestaurant(post.restaurant_id)}
-              className="flex items-center gap-1 font-bold text-emerald-300 border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 rounded-full px-2.5 py-1"
+              className="flex items-center gap-1 text-[11px] font-bold text-emerald-300 border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 rounded-full px-2.5 py-0.5"
             >
               <MapPin className="w-3 h-3" /> {post.restaurant_name}
             </button>
           )}
-          {post.city && <span className="text-slate-400">{post.city}</span>}
+          {isOffer && post.restaurant_id && (
+            <button
+              type="button"
+              onClick={() => onOpenRestaurant(post.restaurant_id)}
+              className="flex items-center gap-1 text-[11px] font-bold text-amber-200 border border-amber-400/40 bg-amber-400/10 hover:bg-amber-400/20 rounded-full px-2.5 py-0.5"
+            >
+              <MapPin className="w-3 h-3" /> View on map
+            </button>
+          )}
         </div>
-      )}
+      </div>
 
-      <div className="flex flex-wrap items-center gap-4 pt-1 border-t border-slate-700/70">
+      <div className="flex items-center gap-5 px-4 py-3 mt-1 border-t border-slate-700/70">
         <button
           type="button"
           onClick={toggleLike}
           aria-pressed={liked}
-          className={`flex items-center gap-1.5 text-xs font-bold pt-2 ${
+          className={`flex items-center gap-1.5 text-xs font-bold ${
             liked ? 'text-emerald-300' : 'text-slate-400 hover:text-white'
           }`}
         >
@@ -4854,42 +5074,14 @@ function PostCard({
             setOpen(next);
             if (next && comments === null) loadComments();
           }}
-          className="flex items-center gap-1.5 text-xs font-bold pt-2 text-slate-400 hover:text-white"
+          className="flex items-center gap-1.5 text-xs font-bold text-slate-400 hover:text-white"
         >
-          <MessageSquare className="w-4 h-4" /> {commentCount}{' '}
-          {commentCount === 1 ? 'comment' : 'comments'}
+          <MessageSquare className="w-4 h-4" /> {commentCount}
         </button>
-        <span className="ml-auto pt-2 flex items-center gap-3">
-          {post.is_mine ? (
-            <ConfirmButton
-              label="Delete"
-              confirmLabel="Delete post"
-              danger
-              onConfirm={deletePost}
-              icon={<Trash2 className="w-3 h-3" />}
-            />
-          ) : (
-            <ConfirmButton
-              label="Report"
-              confirmLabel="Report"
-              onConfirm={() => report('post', post.id)}
-              icon={<Flag className="w-3 h-3" />}
-            />
-          )}
-          {isAdmin && !post.is_mine && (
-            <ConfirmButton
-              label="Remove"
-              confirmLabel="Remove post"
-              danger
-              onConfirm={adminRemove}
-              icon={<Trash2 className="w-3 h-3" />}
-            />
-          )}
-        </span>
       </div>
 
       {open && (
-        <div className="space-y-2">
+        <div className="px-4 pb-4 space-y-2">
           {comments === null ? (
             <p className="text-xs text-slate-500">Loading...</p>
           ) : commentsError ? (
@@ -4906,7 +5098,7 @@ function PostCard({
                     {c.is_author && (
                       <span className="text-[10px] font-bold text-sky-300">Author</span>
                     )}
-                    <span className="text-[11px] text-slate-500">{timeAgoShort(c.created_at)}</span>
+                    <span className="text-[11px] text-slate-500">{agoText(c.created_at)}</span>
                     <span className="ml-auto">
                       {c.is_mine ? (
                         <ConfirmButton
@@ -4967,11 +5159,23 @@ function PostCard({
   );
 }
 
+const COMMUNITY_FILTERS: { key: string; label: string; cls: string }[] = [
+  { key: 'ALL', label: 'All', cls: 'bg-emerald-500/20 border-emerald-500 text-emerald-200' },
+  { key: 'offer', label: 'Offers', cls: 'bg-amber-400/20 border-amber-400 text-amber-200' },
+  { key: 'question', label: 'Questions', cls: 'bg-sky-500/20 border-sky-400 text-sky-200' },
+  { key: 'recommendation', label: 'Recommendations', cls: 'bg-emerald-500/20 border-emerald-500 text-emerald-200' },
+  { key: 'general', label: 'General', cls: 'bg-slate-500/30 border-slate-400 text-slate-100' },
+  { key: 'new_opening', label: 'New openings', cls: 'bg-violet-500/20 border-violet-400 text-violet-200' },
+  { key: 'warning', label: 'Heads up', cls: 'bg-rose-500/20 border-rose-400 text-rose-200' },
+];
+
 function CommunityPage({
   supabase,
   user,
   access,
   restaurants,
+  ownedRestaurants,
+  userLocation,
   isAdmin,
   onBack,
   onOpenRestaurant,
@@ -4981,6 +5185,8 @@ function CommunityPage({
   user: any;
   access: CommunityAccess | null;
   restaurants: any[];
+  ownedRestaurants: any[];
+  userLocation: { latitude: number; longitude: number };
   isAdmin: boolean;
   onBack: () => void;
   onOpenRestaurant: (id: number) => void;
@@ -4995,6 +5201,15 @@ function CommunityPage({
   const [hasMore, setHasMore] = useState(false);
   const [photoUrls, setPhotoUrls] = useState<Record<string, string>>({});
   const [composing, setComposing] = useState(false);
+  const canCompose = !!access && (access.canPost || access.canOffer);
+
+  const coords = useMemo(() => {
+    const m: Record<number, { lat: number; lng: number }> = {};
+    restaurants.forEach((r: any) => {
+      if (typeof r.lat === 'number' && typeof r.lng === 'number') m[r.id] = { lat: r.lat, lng: r.lng };
+    });
+    return m;
+  }, [restaurants]);
 
   const load = useCallback(
     async (reset: boolean, before: string | null) => {
@@ -5060,77 +5275,30 @@ function CommunityPage({
   }, [posts]);
 
   return (
-    <div className="space-y-5 max-w-2xl">
+    <div className="space-y-4 max-w-xl mx-auto pb-28">
       <div className="space-y-1">
         <button onClick={onBack} className="text-xs text-emerald-400 hover:underline">
           &larr; Back to the map
         </button>
         <h2 className="text-2xl font-black text-white">Community</h2>
-        <p className="text-sm text-slate-400">
-          {access ? (
-            <>
-              You appear here as{' '}
-              <span className="font-bold text-white">{access.displayName}</span>.{' '}
-              {access.tier === 'trusted'
-                ? 'As a Trusted Scout your username is shown.'
-                : 'Your username stays hidden until you reach 1,000 points.'}
-            </>
-          ) : (
-            'Share tips and ask questions with other scouts.'
-          )}
-        </p>
+        {access && (
+          <p className="text-xs text-slate-400">
+            You appear as{' '}
+            <span className="font-bold text-white">{access.displayName}</span>.{' '}
+            {access.tier === 'trusted'
+              ? 'As a Trusted Scout your username is shown.'
+              : 'Your username stays hidden until you reach 1,000 points.'}
+          </p>
+        )}
       </div>
 
-      {access?.canPost ? (
-        composing ? (
-          <PostComposer
-            supabase={supabase}
-            userId={user.id}
-            restaurants={restaurants}
-            setNotice={setNotice}
-            onPosted={() => {
-              setComposing(false);
-              load(true, null);
-            }}
-          />
-        ) : (
-          <button
-            type="button"
-            onClick={() => setComposing(true)}
-            className="w-full text-left bg-slate-800/60 hover:bg-slate-800 border border-slate-700 rounded-2xl px-4 py-3 text-sm text-slate-400"
-          >
-            Start a post...
-          </button>
-        )
-      ) : (
-        <div className="bg-slate-800/40 border border-slate-700 rounded-2xl px-4 py-3 text-sm text-slate-400">
-          Reach <span className="font-bold text-slate-200">Silver Scout (200 points)</span> to start
-          posts. You can comment on any post now.
-        </div>
-      )}
-
-      <div className="space-y-2">
-        <div className="flex gap-1.5 overflow-x-auto pb-1">
-          {[{ key: 'ALL', label: 'All', emoji: '' }, ...COMMUNITY_CATEGORIES].map((c) => (
-            <button
-              key={c.key}
-              type="button"
-              onClick={() => setCategory(c.key)}
-              className={`shrink-0 text-xs font-bold px-3 py-1.5 rounded-full border transition ${
-                category === c.key
-                  ? 'bg-emerald-500/20 border-emerald-500 text-emerald-200'
-                  : 'border-slate-700 text-slate-400 hover:text-white'
-              }`}
-            >
-              {c.emoji} {c.label}
-            </button>
-          ))}
-        </div>
+      <div className="flex items-center justify-between">
+        <span className="text-sm font-bold text-slate-300">Scout feed</span>
         {cities.length > 0 && (
           <select
             value={city}
             onChange={(e) => setCity(e.target.value)}
-            className={FIELD + ' max-w-xs'}
+            className="bg-slate-800 border border-slate-700 rounded-lg px-2 py-1 text-xs text-white max-w-[55%]"
             aria-label="Filter by city"
           >
             <option value="">All cities</option>
@@ -5143,6 +5311,30 @@ function CommunityPage({
         )}
       </div>
 
+      <div className="flex gap-1.5 overflow-x-auto pb-1 -mx-4 px-4" role="tablist" aria-label="Filter posts">
+        {COMMUNITY_FILTERS.map((f) => (
+          <button
+            key={f.key}
+            type="button"
+            role="tab"
+            aria-selected={category === f.key}
+            onClick={() => setCategory(f.key)}
+            className={`shrink-0 text-xs font-bold px-3 py-1.5 rounded-full border transition ${
+              category === f.key ? f.cls : 'border-slate-700 text-slate-400 hover:text-white'
+            }`}
+          >
+            {f.label}
+          </button>
+        ))}
+      </div>
+
+      {!canCompose && access && (
+        <div className="bg-slate-800/40 border border-slate-700 rounded-xl px-3 py-2 text-xs text-slate-400">
+          Reach <span className="font-bold text-slate-200">Silver Scout (200 points)</span> to start
+          posts. You can like and comment on any post now.
+        </div>
+      )}
+
       {failed ? (
         <p className="text-sm text-rose-300">
           Could not load the community. Have you run community.sql?
@@ -5150,24 +5342,32 @@ function CommunityPage({
       ) : posts.length === 0 && !loading ? (
         <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 text-center text-sm text-slate-400">
           Nothing here yet.
-          {access?.canPost ? ' Be the first to post.' : ''}
+          {canCompose ? ' Tap the + button to post.' : ''}
         </div>
       ) : (
         <div className="space-y-4">
-          {posts.map((p: any) => (
-            <PostCard
-              key={p.id}
-              post={p}
-              photoUrls={photoUrls}
-              supabase={supabase}
-              isAdmin={isAdmin}
-              onOpenRestaurant={onOpenRestaurant}
-              setNotice={setNotice}
-              onRemoved={(id: number) =>
-                setPosts((prev) => prev.filter((x: any) => x.id !== id))
-              }
-            />
-          ))}
+          {posts.map((p: any) => {
+            const c = p.restaurant_id ? coords[p.restaurant_id] : null;
+            return (
+              <PostCard
+                key={p.id}
+                post={p}
+                photoUrls={photoUrls}
+                distanceMiles={
+                  c
+                    ? calculateDistanceMiles(userLocation.latitude, userLocation.longitude, c.lat, c.lng)
+                    : null
+                }
+                supabase={supabase}
+                isAdmin={isAdmin}
+                onOpenRestaurant={onOpenRestaurant}
+                setNotice={setNotice}
+                onRemoved={(id: number) =>
+                  setPosts((prev) => prev.filter((x: any) => x.id !== id))
+                }
+              />
+            );
+          })}
           {loading && <p className="text-sm text-slate-500 text-center">Loading...</p>}
           {hasMore && !loading && (
             <button
@@ -5179,6 +5379,33 @@ function CommunityPage({
             </button>
           )}
         </div>
+      )}
+
+      {canCompose && access && (
+        <button
+          type="button"
+          onClick={() => setComposing(true)}
+          aria-label="New post"
+          className="fixed bottom-5 right-5 z-30 w-14 h-14 rounded-full bg-emerald-500 hover:bg-emerald-400 text-slate-950 shadow-xl shadow-emerald-900/40 flex items-center justify-center transition active:scale-95"
+        >
+          <Plus className="w-7 h-7" strokeWidth={2.5} />
+        </button>
+      )}
+
+      {composing && access && (
+        <PostComposer
+          supabase={supabase}
+          userId={user.id}
+          restaurants={restaurants}
+          ownedRestaurants={ownedRestaurants}
+          access={access}
+          setNotice={setNotice}
+          onClose={() => setComposing(false)}
+          onPosted={() => {
+            setComposing(false);
+            load(true, null);
+          }}
+        />
       )}
     </div>
   );
@@ -5608,6 +5835,7 @@ export default function UKHalalAppMapbox() {
     }
     setCommunityAccess({
       canPost: row.can_post === true,
+      canOffer: row.can_offer === true,
       tier: String(row.tier ?? 'novice'),
       displayName: String(row.display_name ?? ''),
     });
@@ -6808,6 +7036,10 @@ export default function UKHalalAppMapbox() {
             user={user}
             access={communityAccess}
             restaurants={restaurants}
+            ownedRestaurants={restaurants.filter((r: any) =>
+              ownedRestaurantIds.includes(r.id)
+            )}
+            userLocation={userLocation}
             isAdmin={addLevel === 'admin'}
             onBack={() => setPage('HOME')}
             onOpenRestaurant={(id: number) => viewPlace({ restaurant_id: id })}
