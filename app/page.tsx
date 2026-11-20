@@ -5437,7 +5437,7 @@ export default function UKHalalAppMapbox() {
               HALAL SCOUT UK
             </div>
             <span className="text-xs text-slate-400 hidden sm:inline">
-              Waze-Style Discovery
+              Find halal food near you
             </span>
           </div>
 
