@@ -5,17 +5,30 @@ import { Inter } from 'next/font/google';
 const inter = Inter({ subsets: ['latin'] });
 
 export const metadata: Metadata = {
+  metadataBase: new URL('https://www.halalscout.uk'),
   title: "Halal Scout UK",
   description: "Find halal restaurants near you across the UK. HMC certified places, community reviews and photos.",
   openGraph: {
     title: "Halal Scout UK",
     description: "Find halal restaurants near you across the UK.",
-    url: 'https://halalscout.uk',
-    images: [{ url: 'https://halalscout.uk/HSUK.jpg', width: 1200, height: 630 }],
+    url: 'https://www.halalscout.uk',
+    siteName: 'Halal Scout UK',
+    type: 'website',
+    images: [
+      {
+        url: 'https://www.halalscout.uk/HSUK.jpg',
+        width: 1200,
+        height: 630,
+        type: 'image/jpeg',
+        alt: 'Halal Scout UK',
+      },
+    ],
   },
   twitter: {
     card: 'summary_large_image',
-    images: ['https://halalscout.uk/HSUK.jpg'],
+    title: "Halal Scout UK",
+    description: "Find halal restaurants near you across the UK.",
+    images: ['https://www.halalscout.uk/HSUK.jpg'],
   },
 };
 
