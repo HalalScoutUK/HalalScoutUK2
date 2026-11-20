@@ -51,6 +51,7 @@ import {
   Trophy,
   Plus,
   ClipboardCheck,
+  Users,
 } from 'lucide-react';
 
 /* ------------------------------------------------------------------ */
@@ -4065,6 +4066,7 @@ function ReviewQueuePage({
   onChanged: () => void;
   setNotice: (s: string) => void;
 }) {
+  const [tab, setTab] = useState<'PLACES' | 'COMMUNITY'>('PLACES');
   const [items, setItems] = useState<any[] | null>(null);
   const [failed, setFailed] = useState(false);
 
@@ -4091,12 +4093,41 @@ function ReviewQueuePage({
         </button>
         <h2 className="text-2xl font-black text-white">Review queue</h2>
         <p className="text-sm text-slate-400">
-          Restaurants suggested by Trusted Scouts. Nothing here is public until you
-          approve it.
+          {tab === 'PLACES'
+            ? 'Restaurants suggested by Trusted Scouts. Nothing here is public until you approve it.'
+            : 'Community posts and comments that members have reported. Anything reported by 3 people is hidden until you decide.'}
         </p>
       </div>
 
-      {items === null ? (
+      <div className="flex gap-1.5">
+        {(
+          [
+            ['PLACES', 'New places'],
+            ['COMMUNITY', 'Community reports'],
+          ] as const
+        ).map(([k, label]) => (
+          <button
+            key={k}
+            type="button"
+            onClick={() => setTab(k)}
+            className={`text-xs font-bold px-3 py-1.5 rounded-full border transition ${
+              tab === k
+                ? 'bg-amber-400/20 border-amber-400 text-amber-200'
+                : 'border-slate-700 text-slate-400 hover:text-white'
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'COMMUNITY' ? (
+        <CommunityModerationPanel
+          supabase={supabase}
+          onChanged={onChanged}
+          setNotice={setNotice}
+        />
+      ) : items === null ? (
         <p className="text-sm text-slate-400">Loading...</p>
       ) : failed ? (
         <p className="text-sm text-rose-300">
@@ -4123,6 +4154,1146 @@ function ReviewQueuePage({
           ))}
         </div>
       )}
+    </div>
+  );
+}
+
+// ===========================================================================
+// Community: a signed-in-only feed of posts (text, photos, a 10-second video,
+// an optional restaurant tag) with comments, likes and reports.
+// Names are anonymous ("Gold Scout 48213") until a member reaches 1,000+
+// points. The database decides who is allowed to do what; the app only decides
+// which buttons to show.
+// ===========================================================================
+
+const COMMUNITY_CATEGORIES: { key: string; label: string; emoji: string; cls: string }[] = [
+  { key: 'recommendation', label: 'Recommendation', emoji: '👍', cls: 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40' },
+  { key: 'question', label: 'Question', emoji: '❓', cls: 'bg-sky-500/15 text-sky-300 border-sky-500/40' },
+  { key: 'warning', label: 'Heads up', emoji: '⚠️', cls: 'bg-rose-500/15 text-rose-300 border-rose-500/40' },
+  { key: 'new_opening', label: 'New opening', emoji: '🆕', cls: 'bg-violet-500/15 text-violet-300 border-violet-500/40' },
+  { key: 'general', label: 'General', emoji: '💬', cls: 'bg-slate-500/20 text-slate-200 border-slate-500/40' },
+];
+
+const COMMUNITY_TIERS: Record<string, { label: string; cls: string }> = {
+  novice: { label: '🥉 Novice', cls: 'bg-orange-400/15 text-orange-300 border-orange-400/40' },
+  silver: { label: '🥈 Silver', cls: 'bg-slate-300/20 text-slate-200 border-slate-400/40' },
+  gold: { label: '🥇 Gold', cls: 'bg-amber-400/20 text-amber-300 border-amber-400/40' },
+  trusted: { label: '⭐ Trusted', cls: 'bg-amber-400/20 text-amber-300 border-amber-400/40' },
+};
+
+const COMMUNITY_MAX_VIDEO_SECONDS = 10;
+const COMMUNITY_MAX_VIDEO_MB = 80;
+const COMMUNITY_BUCKET = 'community-media';
+const COMMUNITY_PAGE_SIZE = 20;
+
+type CommunityAccess = { canPost: boolean; tier: string; displayName: string };
+
+function communityError(message: string): string {
+  const m = message || '';
+  const table: [string, string][] = [
+    ['not_allowed_to_post', 'You need to be a Silver Scout (200 points) to start a post. You can still comment.'],
+    ['post_too_short', 'Write a little more (at least 3 characters).'],
+    ['post_too_long', 'Posts can be up to 1,000 characters.'],
+    ['comment_empty', 'Write something first.'],
+    ['comment_too_long', 'Comments can be up to 500 characters.'],
+    ['no_links', 'Links and repeated characters are not allowed.'],
+    ['invalid_city', 'That town or city does not look right.'],
+    ['invalid_category', 'Choose a category.'],
+    ['restaurant_not_available', 'That restaurant is not currently listed.'],
+    ['too_many_photos', 'You can add up to 3 photos.'],
+    ['photo_not_found', 'A photo did not upload properly. Please try again.'],
+    ['video_not_ready', 'The video is not ready yet. Please try again.'],
+    ['video_too_long', `Videos can be up to ${COMMUNITY_MAX_VIDEO_SECONDS} seconds.`],
+    ['mp4_fallback_disabled', 'Video is not fully set up yet. Please contact support.'],
+    ['server_not_configured', 'Video is not set up yet. Please contact support.'],
+    ['processing_failed', 'That video could not be processed. Try a different one.'],
+    ['rate_limited', 'You have done a lot today. Please try again tomorrow.'],
+    ['post_not_available', 'This post is no longer available.'],
+    ['item_not_available', 'This is no longer available.'],
+    ['cannot_report_own', 'You cannot report your own post.'],
+    ['username_required', 'Please choose a username first.'],
+    ['not_authenticated', 'Please sign in first.'],
+    ['not_admin', 'Only admins can do this.'],
+    ['timeout', 'The video is taking too long. Please try again.'],
+  ];
+  for (const [k, v] of table) if (m.includes(k)) return v;
+  if (/network|fetch|failed to send|offline/i.test(m))
+    return 'Your connection dropped. Please try again.';
+  console.error('community error:', m);
+  return `Something went wrong: ${m.slice(0, 160) || 'unknown error'}`;
+}
+
+function TierPill({ tier }: { tier: string }) {
+  const t = COMMUNITY_TIERS[tier] ?? COMMUNITY_TIERS.novice;
+  return (
+    <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${t.cls}`}>
+      {t.label}
+    </span>
+  );
+}
+
+function CategoryPill({ cat }: { cat: string }) {
+  const c = COMMUNITY_CATEGORIES.find((x) => x.key === cat) ?? COMMUNITY_CATEGORIES[4];
+  return (
+    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${c.cls}`}>
+      {c.emoji} {c.label}
+    </span>
+  );
+}
+
+// Two taps: "Report" then "Confirm"
+function ConfirmButton({
+  label,
+  confirmLabel,
+  onConfirm,
+  icon,
+  danger = false,
+}: {
+  label: string;
+  confirmLabel: string;
+  onConfirm: () => void;
+  icon?: React.ReactNode;
+  danger?: boolean;
+}) {
+  const [asking, setAsking] = useState(false);
+  if (asking) {
+    return (
+      <span className="flex items-center gap-2 text-[11px]">
+        <button
+          type="button"
+          onClick={() => {
+            setAsking(false);
+            onConfirm();
+          }}
+          className={`font-bold ${danger ? 'text-rose-300' : 'text-amber-300'} underline`}
+        >
+          {confirmLabel}
+        </button>
+        <button
+          type="button"
+          onClick={() => setAsking(false)}
+          className="text-slate-400 hover:text-white"
+        >
+          Cancel
+        </button>
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      onClick={() => setAsking(true)}
+      className="flex items-center gap-1 text-[11px] text-slate-500 hover:text-slate-200"
+    >
+      {icon} {label}
+    </button>
+  );
+}
+
+async function uploadCommunityVideo(
+  supabase: any,
+  file: File,
+  onProgress: (text: string) => void
+): Promise<string> {
+  const { data: creds, error: credErr } = await supabase.functions.invoke('community-video', {
+    body: { action: 'create-upload' },
+  });
+  if (credErr || !creds || creds.error) {
+    throw new Error(creds?.error ?? credErr?.message ?? 'upload_setup_failed');
+  }
+  const videoId: string = creds.videoId;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const upload = new tus.Upload(file, {
+        endpoint: BUNNY_TUS_ENDPOINT,
+        retryDelays: [0, 3000, 5000, 10000, 20000],
+        headers: {
+          AuthorizationSignature: String(creds.signature),
+          AuthorizationExpire: String(creds.expirationTime),
+          VideoId: videoId,
+          LibraryId: String(creds.libraryId),
+        },
+        metadata: { filetype: file.type, title: 'community' },
+        onError: (err: any) => reject(err),
+        onProgress: (sent: number, total: number) =>
+          onProgress(`Uploading video ${total ? Math.round((sent / total) * 100) : 0}%`),
+        onSuccess: () => resolve(),
+      });
+      upload.start();
+    });
+
+    const started = Date.now();
+    for (;;) {
+      onProgress('Preparing video...');
+      await sleep(3000);
+      const { data: st, error: stErr } = await supabase.functions.invoke('community-video', {
+        body: { action: 'finalize', videoId },
+      });
+      if (stErr || !st) throw new Error(stErr?.message ?? 'status_failed');
+      if (st.error) throw new Error(st.error);
+      if (st.ready) return videoId;
+      if (Date.now() - started > 5 * 60 * 1000) throw new Error('timeout');
+    }
+  } catch (e) {
+    void supabase.functions.invoke('community-video', {
+      body: { action: 'delete', videoId },
+    });
+    throw e;
+  }
+}
+
+function PostComposer({
+  supabase,
+  userId,
+  restaurants,
+  onPosted,
+  setNotice,
+}: {
+  supabase: any;
+  userId: string;
+  restaurants: any[];
+  onPosted: () => void;
+  setNotice: (s: string) => void;
+}) {
+  const [category, setCategory] = useState('recommendation');
+  const [city, setCity] = useState('');
+  const [tagged, setTagged] = useState<{ id: number; name: string } | null>(null);
+  const [search, setSearch] = useState('');
+  const [body, setBody] = useState('');
+  const [photos, setPhotos] = useState<{ file: File; url: string }[]>([]);
+  const [video, setVideo] = useState<{ file: File; url: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState('');
+  const [error, setError] = useState('');
+  const photoInput = useRef<HTMLInputElement>(null);
+  const videoInput = useRef<HTMLInputElement>(null);
+
+  const cities = useMemo(() => {
+    const set = new Set<string>();
+    restaurants.forEach((r: any) => {
+      if (typeof r.city === 'string' && r.city.trim()) set.add(r.city.trim());
+    });
+    return Array.from(set).sort().slice(0, 300);
+  }, [restaurants]);
+
+  const matches = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (q.length < 2) return [];
+    return restaurants
+      .filter((r: any) => String(r.name ?? '').toLowerCase().includes(q))
+      .slice(0, 6);
+  }, [search, restaurants]);
+
+  function addPhotos(files: FileList | null) {
+    if (!files) return;
+    const next = [...photos];
+    for (const f of Array.from(files)) {
+      if (next.length >= 3) break;
+      if (!ALLOWED_PHOTO_TYPES.includes(f.type)) {
+        setError('Photos must be JPEG, PNG or WebP.');
+        continue;
+      }
+      if (f.size > 25 * 1024 * 1024) {
+        setError('That photo is very large. Please choose one under 25 MB.');
+        continue;
+      }
+      next.push({ file: f, url: URL.createObjectURL(f) });
+    }
+    setPhotos(next);
+  }
+
+  async function pickVideo(files: FileList | null) {
+    const f = files?.[0];
+    if (!f) return;
+    setError('');
+    if (!f.type.startsWith('video/')) {
+      setError('Please choose a video file.');
+      return;
+    }
+    if (f.size > COMMUNITY_MAX_VIDEO_MB * 1024 * 1024) {
+      setError(`That video is too large. Please keep it under ${COMMUNITY_MAX_VIDEO_MB} MB.`);
+      return;
+    }
+    const seconds = await readVideoDuration(f);
+    if (seconds !== null && seconds > COMMUNITY_MAX_VIDEO_SECONDS + 0.5) {
+      setError(`Videos can be up to ${COMMUNITY_MAX_VIDEO_SECONDS} seconds. Yours is ${Math.round(seconds)}.`);
+      return;
+    }
+    if (video) URL.revokeObjectURL(video.url);
+    setVideo({ file: f, url: URL.createObjectURL(f) });
+  }
+
+  async function submit() {
+    if (busy) return;
+    setError('');
+    if (body.trim().length < 3) {
+      setError('Write a little more (at least 3 characters).');
+      return;
+    }
+    setBusy(true);
+    const uploaded: string[] = [];
+    let videoId: string | null = null;
+    try {
+      for (let i = 0; i < photos.length; i++) {
+        setProgress(`Uploading photo ${i + 1} of ${photos.length}...`);
+        const blob = await resizeImage(photos[i].file);
+        const path = `${userId}/${crypto.randomUUID()}.jpg`;
+        const { error: upErr } = await supabase.storage
+          .from(COMMUNITY_BUCKET)
+          .upload(path, blob, { contentType: 'image/jpeg', upsert: false });
+        if (upErr) throw upErr;
+        uploaded.push(path);
+      }
+      if (video) videoId = await uploadCommunityVideo(supabase, video.file, setProgress);
+      setProgress('Posting...');
+      const { error: postErr } = await supabase.rpc('create_community_post', {
+        p_category: category,
+        p_city: city,
+        p_restaurant_id: tagged?.id ?? null,
+        p_body: body,
+        p_photo_paths: uploaded,
+        p_video_id: videoId,
+      });
+      if (postErr) throw postErr;
+      photos.forEach((p) => URL.revokeObjectURL(p.url));
+      if (video) URL.revokeObjectURL(video.url);
+      setPhotos([]);
+      setVideo(null);
+      setBody('');
+      setTagged(null);
+      setSearch('');
+      setNotice('Posted!');
+      onPosted();
+    } catch (e: any) {
+      if (uploaded.length) void supabase.storage.from(COMMUNITY_BUCKET).remove(uploaded);
+      if (videoId)
+        void supabase.functions.invoke('community-video', { body: { action: 'delete', videoId } });
+      setError(communityError(String(e?.message ?? e ?? '')));
+    } finally {
+      setBusy(false);
+      setProgress('');
+    }
+  }
+
+  return (
+    <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-4 space-y-3">
+      <h3 className="text-sm font-black text-white">Start a post</h3>
+
+      <div className="flex flex-wrap gap-1.5">
+        {COMMUNITY_CATEGORIES.map((c) => (
+          <button
+            type="button"
+            key={c.key}
+            onClick={() => setCategory(c.key)}
+            className={`text-xs font-bold px-2.5 py-1 rounded-full border transition ${
+              category === c.key ? c.cls : 'border-slate-700 text-slate-400 hover:text-white'
+            }`}
+          >
+            {c.emoji} {c.label}
+          </button>
+        ))}
+      </div>
+
+      <textarea
+        className={FIELD + ' min-h-[96px]'}
+        value={body}
+        maxLength={1000}
+        onChange={(e) => setBody(e.target.value)}
+        placeholder="What do you want to share with other scouts?"
+      />
+      <div className="flex justify-between text-[11px] text-slate-500 -mt-2">
+        <span>No links, please.</span>
+        <span>{body.length}/1000</span>
+      </div>
+
+      {(photos.length > 0 || video) && (
+        <div className="flex flex-wrap gap-2">
+          {photos.map((p, i) => (
+            <div key={p.url} className="relative">
+              <img src={p.url} alt="" className="w-20 h-20 object-cover rounded-lg border border-slate-700" />
+              <button
+                type="button"
+                aria-label="Remove photo"
+                onClick={() => {
+                  URL.revokeObjectURL(p.url);
+                  setPhotos(photos.filter((_, j) => j !== i));
+                }}
+                className="absolute -top-1.5 -right-1.5 bg-slate-900 border border-slate-600 rounded-full p-0.5"
+              >
+                <X className="w-3 h-3 text-white" />
+              </button>
+            </div>
+          ))}
+          {video && (
+            <div className="relative">
+              <video src={`${video.url}#t=0.1`} muted playsInline className="w-20 h-20 object-cover rounded-lg border border-slate-700" />
+              <span className="absolute bottom-1 left-1 text-[9px] font-bold bg-slate-900/80 text-white px-1 rounded">VIDEO</span>
+              <button
+                type="button"
+                aria-label="Remove video"
+                onClick={() => {
+                  URL.revokeObjectURL(video.url);
+                  setVideo(null);
+                }}
+                className="absolute -top-1.5 -right-1.5 bg-slate-900 border border-slate-600 rounded-full p-0.5"
+              >
+                <X className="w-3 h-3 text-white" />
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      <div className="flex flex-wrap gap-2">
+        <input
+          ref={photoInput}
+          type="file"
+          accept="image/jpeg,image/png,image/webp"
+          multiple
+          hidden
+          onChange={(e) => {
+            addPhotos(e.target.files);
+            e.target.value = '';
+          }}
+        />
+        <input
+          ref={videoInput}
+          type="file"
+          accept="video/*"
+          hidden
+          onChange={(e) => {
+            void pickVideo(e.target.files);
+            e.target.value = '';
+          }}
+        />
+        <button
+          type="button"
+          disabled={photos.length >= 3 || busy}
+          onClick={() => photoInput.current?.click()}
+          className="flex items-center gap-1.5 text-xs font-bold border border-slate-600 text-slate-200 hover:bg-slate-700/50 disabled:opacity-40 rounded-lg px-3 py-1.5"
+        >
+          <ImageIcon className="w-3.5 h-3.5" /> Photo ({photos.length}/3)
+        </button>
+        <button
+          type="button"
+          disabled={!!video || busy}
+          onClick={() => videoInput.current?.click()}
+          className="flex items-center gap-1.5 text-xs font-bold border border-slate-600 text-slate-200 hover:bg-slate-700/50 disabled:opacity-40 rounded-lg px-3 py-1.5"
+        >
+          <Play className="w-3.5 h-3.5" /> Video ({COMMUNITY_MAX_VIDEO_SECONDS}s max)
+        </button>
+      </div>
+
+      <div className="grid sm:grid-cols-2 gap-3">
+        <div>
+          <label className={LABEL}>Town or city (optional)</label>
+          <input
+            className={FIELD}
+            list="community-cities"
+            value={city}
+            maxLength={60}
+            onChange={(e) => setCity(e.target.value)}
+            placeholder="e.g. Birmingham"
+          />
+          <datalist id="community-cities">
+            {cities.map((c) => (
+              <option key={c} value={c} />
+            ))}
+          </datalist>
+        </div>
+        <div className="relative">
+          <label className={LABEL}>Tag a restaurant (optional)</label>
+          {tagged ? (
+            <div className="flex items-center justify-between bg-slate-900 border border-emerald-500/40 rounded-xl px-3 py-2 text-sm text-white">
+              <span className="truncate">{tagged.name}</span>
+              <button
+                type="button"
+                aria-label="Remove tag"
+                onClick={() => setTagged(null)}
+                className="ml-2 text-slate-400 hover:text-white"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          ) : (
+            <>
+              <input
+                className={FIELD}
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Start typing a name"
+              />
+              {matches.length > 0 && (
+                <ul className="absolute z-20 mt-1 w-full bg-slate-900 border border-slate-700 rounded-xl overflow-hidden shadow-xl">
+                  {matches.map((r: any) => (
+                    <li key={r.id}>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setTagged({ id: r.id, name: r.name });
+                          setSearch('');
+                          if (!city.trim() && r.city) setCity(String(r.city));
+                        }}
+                        className="w-full text-left px-3 py-2 text-sm text-white hover:bg-slate-800"
+                      >
+                        {r.name}
+                        <span className="text-[11px] text-slate-400">
+                          {r.city ? `  ${r.city}` : ''}
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <p className="text-sm text-rose-300 bg-rose-500/10 border border-rose-500/30 rounded-xl px-3 py-2">
+          {error}
+        </p>
+      )}
+      <button
+        type="button"
+        onClick={submit}
+        disabled={busy}
+        className="w-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-black rounded-xl py-2.5 text-sm"
+      >
+        {busy ? progress || 'Working...' : 'Post'}
+      </button>
+    </div>
+  );
+}
+
+function PostCard({
+  post,
+  photoUrls,
+  supabase,
+  isAdmin,
+  onOpenRestaurant,
+  onRemoved,
+  setNotice,
+}: {
+  post: any;
+  photoUrls: Record<string, string>;
+  supabase: any;
+  isAdmin: boolean;
+  onOpenRestaurant: (id: number) => void;
+  onRemoved: (id: number) => void;
+  setNotice: (s: string) => void;
+}) {
+  const [liked, setLiked] = useState<boolean>(!!post.liked_by_me);
+  const [likes, setLikes] = useState<number>(Number(post.like_count || 0));
+  const [commentCount, setCommentCount] = useState<number>(Number(post.comment_count || 0));
+  const [open, setOpen] = useState(false);
+  const [comments, setComments] = useState<any[] | null>(null);
+  const [commentsError, setCommentsError] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [sending, setSending] = useState(false);
+
+  const items: MediaItem[] = [];
+  (Array.isArray(post.media) ? post.media : []).forEach((m: any) => {
+    if (m?.type === 'photo' && photoUrls[m.path])
+      items.push({ src: photoUrls[m.path], type: 'image' });
+    else if (m?.type === 'video' && typeof m.url === 'string')
+      items.push({ src: m.url, type: 'video' });
+  });
+
+  async function loadComments() {
+    const { data, error } = await supabase.rpc('get_community_comments', {
+      p_post_id: post.id,
+    });
+    if (error) {
+      setCommentsError(true);
+      setComments([]);
+      return;
+    }
+    setCommentsError(false);
+    setComments((data as any[]) ?? []);
+    setCommentCount(((data as any[]) ?? []).length);
+  }
+
+  async function toggleLike() {
+    const was = liked;
+    setLiked(!was);
+    setLikes((n) => n + (was ? -1 : 1));
+    const { data, error } = await supabase.rpc('toggle_community_like', { p_post_id: post.id });
+    if (error) {
+      setLiked(was);
+      setLikes((n) => n + (was ? 1 : -1));
+      setNotice(communityError(error.message));
+      return;
+    }
+    if (data !== !was) {
+      setLiked(data === true);
+    }
+  }
+
+  async function sendComment() {
+    if (sending || draft.trim().length < 1) return;
+    setSending(true);
+    const { error } = await supabase.rpc('add_community_comment', {
+      p_post_id: post.id,
+      p_body: draft,
+    });
+    setSending(false);
+    if (error) {
+      setNotice(communityError(error.message));
+      return;
+    }
+    setDraft('');
+    loadComments();
+  }
+
+  async function deletePost() {
+    const { data, error } = await supabase.rpc('delete_my_community_post', {
+      p_post_id: post.id,
+    });
+    if (error) {
+      setNotice(communityError(error.message));
+      return;
+    }
+    const info: any = data ?? {};
+    if (Array.isArray(info.photos) && info.photos.length)
+      void supabase.storage.from(COMMUNITY_BUCKET).remove(info.photos);
+    if (typeof info.video_id === 'string' && info.video_id)
+      void supabase.functions.invoke('community-video', {
+        body: { action: 'delete', videoId: info.video_id },
+      });
+    onRemoved(post.id);
+    setNotice('Post deleted.');
+  }
+
+  async function adminRemove() {
+    const { error } = await supabase.rpc('moderate_community_item', {
+      p_kind: 'post',
+      p_id: post.id,
+      p_action: 'remove',
+    });
+    if (error) {
+      setNotice(communityError(error.message));
+      return;
+    }
+    onRemoved(post.id);
+    setNotice('Post removed.');
+  }
+
+  async function report(kind: 'post' | 'comment', id: number) {
+    const { error } = await supabase.rpc('report_community_item', {
+      p_kind: kind,
+      p_id: id,
+      p_reason: null,
+    });
+    setNotice(error ? communityError(error.message) : 'Thanks, we will look into it.');
+  }
+
+  return (
+    <article className="bg-slate-800/60 border border-slate-700 rounded-2xl p-4 space-y-3">
+      <header className="flex flex-wrap items-center gap-2">
+        <span className="text-sm font-black text-white">{post.display_name}</span>
+        <TierPill tier={post.author_tier} />
+        {post.is_mine && <span className="text-[10px] text-emerald-300 font-bold">You</span>}
+        <span className="text-[11px] text-slate-500">{timeAgoShort(post.created_at)}</span>
+        <span className="ml-auto flex items-center gap-1.5">
+          <CategoryPill cat={post.category} />
+        </span>
+      </header>
+
+      <p className="text-sm text-slate-100 whitespace-pre-wrap break-words">{post.body}</p>
+
+      {items.length > 0 && (
+        <div className={items.length === 1 ? '' : 'grid grid-cols-2 gap-2'}>
+          {items.map((it, i) => (
+            <ViewableMedia
+              key={`${it.src}-${i}`}
+              items={items}
+              index={i}
+              caption={post.body}
+              className={`block w-full overflow-hidden rounded-xl bg-slate-900 ${
+                items.length === 1 ? 'aspect-video' : 'aspect-square'
+              }`}
+            >
+              <MediaPreview item={it} alt="Post media" className="w-full h-full object-cover" />
+            </ViewableMedia>
+          ))}
+        </div>
+      )}
+
+      {(post.restaurant_id || post.city) && (
+        <div className="flex flex-wrap items-center gap-2 text-[11px]">
+          {post.restaurant_id && post.restaurant_name && (
+            <button
+              type="button"
+              onClick={() => onOpenRestaurant(post.restaurant_id)}
+              className="flex items-center gap-1 font-bold text-emerald-300 border border-emerald-500/40 bg-emerald-500/10 hover:bg-emerald-500/20 rounded-full px-2.5 py-1"
+            >
+              <MapPin className="w-3 h-3" /> {post.restaurant_name}
+            </button>
+          )}
+          {post.city && <span className="text-slate-400">{post.city}</span>}
+        </div>
+      )}
+
+      <div className="flex flex-wrap items-center gap-4 pt-1 border-t border-slate-700/70">
+        <button
+          type="button"
+          onClick={toggleLike}
+          aria-pressed={liked}
+          className={`flex items-center gap-1.5 text-xs font-bold pt-2 ${
+            liked ? 'text-emerald-300' : 'text-slate-400 hover:text-white'
+          }`}
+        >
+          <ThumbsUp className="w-4 h-4" fill={liked ? 'currentColor' : 'none'} /> {likes}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            const next = !open;
+            setOpen(next);
+            if (next && comments === null) loadComments();
+          }}
+          className="flex items-center gap-1.5 text-xs font-bold pt-2 text-slate-400 hover:text-white"
+        >
+          <MessageSquare className="w-4 h-4" /> {commentCount}{' '}
+          {commentCount === 1 ? 'comment' : 'comments'}
+        </button>
+        <span className="ml-auto pt-2 flex items-center gap-3">
+          {post.is_mine ? (
+            <ConfirmButton
+              label="Delete"
+              confirmLabel="Delete post"
+              danger
+              onConfirm={deletePost}
+              icon={<Trash2 className="w-3 h-3" />}
+            />
+          ) : (
+            <ConfirmButton
+              label="Report"
+              confirmLabel="Report"
+              onConfirm={() => report('post', post.id)}
+              icon={<Flag className="w-3 h-3" />}
+            />
+          )}
+          {isAdmin && !post.is_mine && (
+            <ConfirmButton
+              label="Remove"
+              confirmLabel="Remove post"
+              danger
+              onConfirm={adminRemove}
+              icon={<Trash2 className="w-3 h-3" />}
+            />
+          )}
+        </span>
+      </div>
+
+      {open && (
+        <div className="space-y-2">
+          {comments === null ? (
+            <p className="text-xs text-slate-500">Loading...</p>
+          ) : commentsError ? (
+            <p className="text-xs text-rose-300">Could not load comments.</p>
+          ) : comments.length === 0 ? (
+            <p className="text-xs text-slate-500">No comments yet. Be the first.</p>
+          ) : (
+            <ul className="space-y-2">
+              {comments.map((c: any) => (
+                <li key={c.id} className="bg-slate-900/70 border border-slate-800 rounded-xl px-3 py-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-xs font-bold text-white">{c.display_name}</span>
+                    <TierPill tier={c.author_tier} />
+                    {c.is_author && (
+                      <span className="text-[10px] font-bold text-sky-300">Author</span>
+                    )}
+                    <span className="text-[11px] text-slate-500">{timeAgoShort(c.created_at)}</span>
+                    <span className="ml-auto">
+                      {c.is_mine ? (
+                        <ConfirmButton
+                          label="Delete"
+                          confirmLabel="Delete"
+                          danger
+                          onConfirm={async () => {
+                            const { error } = await supabase.rpc('delete_my_community_comment', {
+                              p_id: c.id,
+                            });
+                            if (error) setNotice(communityError(error.message));
+                            else loadComments();
+                          }}
+                        />
+                      ) : (
+                        <ConfirmButton
+                          label="Report"
+                          confirmLabel="Report"
+                          onConfirm={() => report('comment', c.id)}
+                        />
+                      )}
+                    </span>
+                  </div>
+                  <p className="text-sm text-slate-200 whitespace-pre-wrap break-words mt-0.5">
+                    {c.body}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="flex gap-2">
+            <input
+              className={FIELD}
+              value={draft}
+              maxLength={500}
+              onChange={(e) => setDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  sendComment();
+                }
+              }}
+              placeholder="Write a comment"
+            />
+            <button
+              type="button"
+              onClick={sendComment}
+              disabled={sending || draft.trim().length < 1}
+              aria-label="Send comment"
+              className="shrink-0 px-3 rounded-xl bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white"
+            >
+              <Send className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+    </article>
+  );
+}
+
+function CommunityPage({
+  supabase,
+  user,
+  access,
+  restaurants,
+  isAdmin,
+  onBack,
+  onOpenRestaurant,
+  setNotice,
+}: {
+  supabase: any;
+  user: any;
+  access: CommunityAccess | null;
+  restaurants: any[];
+  isAdmin: boolean;
+  onBack: () => void;
+  onOpenRestaurant: (id: number) => void;
+  setNotice: (s: string) => void;
+}) {
+  const [category, setCategory] = useState('ALL');
+  const [city, setCity] = useState('');
+  const [posts, setPosts] = useState<any[]>([]);
+  const [cities, setCities] = useState<{ city: string; posts: number }[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+  const [hasMore, setHasMore] = useState(false);
+  const [photoUrls, setPhotoUrls] = useState<Record<string, string>>({});
+  const [composing, setComposing] = useState(false);
+
+  const load = useCallback(
+    async (reset: boolean, before: string | null) => {
+      setLoading(true);
+      const { data, error } = await supabase.rpc('get_community_feed', {
+        p_category: category === 'ALL' ? null : category,
+        p_city: city || null,
+        p_limit: COMMUNITY_PAGE_SIZE,
+        p_before: reset ? null : before,
+      });
+      setLoading(false);
+      if (error) {
+        setFailed(true);
+        if (reset) setPosts([]);
+        return;
+      }
+      setFailed(false);
+      const rows = (data as any[]) ?? [];
+      setHasMore(rows.length === COMMUNITY_PAGE_SIZE);
+      setPosts((prev) => (reset ? rows : [...prev, ...rows]));
+    },
+    [supabase, category, city]
+  );
+
+  useEffect(() => {
+    load(true, null);
+  }, [load]);
+
+  useEffect(() => {
+    supabase.rpc('get_community_cities').then(({ data }: any) => {
+      setCities(Array.isArray(data) ? data : []);
+    });
+  }, [supabase]);
+
+  // Photos are private, so each one needs a short-lived link
+  useEffect(() => {
+    const paths: string[] = [];
+    posts.forEach((p: any) =>
+      (Array.isArray(p.media) ? p.media : []).forEach((m: any) => {
+        if (m?.type === 'photo' && typeof m.path === 'string' && !photoUrls[m.path])
+          paths.push(m.path);
+      })
+    );
+    if (paths.length === 0) return;
+    let cancelled = false;
+    supabase.storage
+      .from(COMMUNITY_BUCKET)
+      .createSignedUrls(paths, 3600)
+      .then(({ data }: any) => {
+        if (cancelled || !data) return;
+        setPhotoUrls((prev) => {
+          const next = { ...prev };
+          data.forEach((d: any) => {
+            if (d.signedUrl && d.path) next[d.path] = d.signedUrl;
+          });
+          return next;
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [posts]);
+
+  return (
+    <div className="space-y-5 max-w-2xl">
+      <div className="space-y-1">
+        <button onClick={onBack} className="text-xs text-emerald-400 hover:underline">
+          &larr; Back to the map
+        </button>
+        <h2 className="text-2xl font-black text-white">Community</h2>
+        <p className="text-sm text-slate-400">
+          {access ? (
+            <>
+              You appear here as{' '}
+              <span className="font-bold text-white">{access.displayName}</span>.{' '}
+              {access.tier === 'trusted'
+                ? 'As a Trusted Scout your username is shown.'
+                : 'Your username stays hidden until you reach 1,000 points.'}
+            </>
+          ) : (
+            'Share tips and ask questions with other scouts.'
+          )}
+        </p>
+      </div>
+
+      {access?.canPost ? (
+        composing ? (
+          <PostComposer
+            supabase={supabase}
+            userId={user.id}
+            restaurants={restaurants}
+            setNotice={setNotice}
+            onPosted={() => {
+              setComposing(false);
+              load(true, null);
+            }}
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={() => setComposing(true)}
+            className="w-full text-left bg-slate-800/60 hover:bg-slate-800 border border-slate-700 rounded-2xl px-4 py-3 text-sm text-slate-400"
+          >
+            Start a post...
+          </button>
+        )
+      ) : (
+        <div className="bg-slate-800/40 border border-slate-700 rounded-2xl px-4 py-3 text-sm text-slate-400">
+          Reach <span className="font-bold text-slate-200">Silver Scout (200 points)</span> to start
+          posts. You can comment on any post now.
+        </div>
+      )}
+
+      <div className="space-y-2">
+        <div className="flex gap-1.5 overflow-x-auto pb-1">
+          {[{ key: 'ALL', label: 'All', emoji: '' }, ...COMMUNITY_CATEGORIES].map((c) => (
+            <button
+              key={c.key}
+              type="button"
+              onClick={() => setCategory(c.key)}
+              className={`shrink-0 text-xs font-bold px-3 py-1.5 rounded-full border transition ${
+                category === c.key
+                  ? 'bg-emerald-500/20 border-emerald-500 text-emerald-200'
+                  : 'border-slate-700 text-slate-400 hover:text-white'
+              }`}
+            >
+              {c.emoji} {c.label}
+            </button>
+          ))}
+        </div>
+        {cities.length > 0 && (
+          <select
+            value={city}
+            onChange={(e) => setCity(e.target.value)}
+            className={FIELD + ' max-w-xs'}
+            aria-label="Filter by city"
+          >
+            <option value="">All cities</option>
+            {cities.map((c) => (
+              <option key={c.city} value={c.city}>
+                {c.city} ({c.posts})
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      {failed ? (
+        <p className="text-sm text-rose-300">
+          Could not load the community. Have you run community.sql?
+        </p>
+      ) : posts.length === 0 && !loading ? (
+        <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 text-center text-sm text-slate-400">
+          Nothing here yet.
+          {access?.canPost ? ' Be the first to post.' : ''}
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {posts.map((p: any) => (
+            <PostCard
+              key={p.id}
+              post={p}
+              photoUrls={photoUrls}
+              supabase={supabase}
+              isAdmin={isAdmin}
+              onOpenRestaurant={onOpenRestaurant}
+              setNotice={setNotice}
+              onRemoved={(id: number) =>
+                setPosts((prev) => prev.filter((x: any) => x.id !== id))
+              }
+            />
+          ))}
+          {loading && <p className="text-sm text-slate-500 text-center">Loading...</p>}
+          {hasMore && !loading && (
+            <button
+              type="button"
+              onClick={() => load(false, posts[posts.length - 1]?.created_at ?? null)}
+              className="w-full border border-slate-700 text-slate-300 hover:bg-slate-800 rounded-xl py-2 text-sm font-bold"
+            >
+              Load more
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CommunityModerationPanel({
+  supabase,
+  onChanged,
+  setNotice,
+}: {
+  supabase: any;
+  onChanged: () => void;
+  setNotice: (s: string) => void;
+}) {
+  const [items, setItems] = useState<any[] | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  const load = useCallback(async () => {
+    const { data, error } = await supabase.rpc('get_community_moderation_queue');
+    if (error) {
+      setFailed(true);
+      setItems([]);
+      return;
+    }
+    setFailed(false);
+    setItems((data as any[]) ?? []);
+  }, [supabase]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function act(it: any, action: 'restore' | 'remove') {
+    const { error } = await supabase.rpc('moderate_community_item', {
+      p_kind: it.kind,
+      p_id: it.item_id,
+      p_action: action,
+    });
+    if (error) {
+      setNotice(communityError(error.message));
+      return;
+    }
+    setNotice(action === 'restore' ? 'Restored.' : 'Removed.');
+    load();
+    onChanged();
+  }
+
+  if (items === null) return <p className="text-sm text-slate-400">Loading...</p>;
+  if (failed)
+    return (
+      <p className="text-sm text-rose-300">
+        Could not load reports. Have you run community.sql?
+      </p>
+    );
+  if (items.length === 0)
+    return (
+      <div className="bg-slate-800/60 border border-slate-700 rounded-2xl p-6 text-center text-sm text-slate-400">
+        No reported posts or comments.
+      </div>
+    );
+
+  return (
+    <div className="space-y-3">
+      {items.map((it: any) => (
+        <div
+          key={`${it.kind}-${it.item_id}`}
+          className="bg-slate-800/60 border border-slate-700 rounded-2xl p-4 space-y-2"
+        >
+          <div className="flex flex-wrap items-center gap-2 text-[11px]">
+            <span className="font-bold uppercase text-slate-300">{it.kind}</span>
+            <span
+              className={`font-bold px-2 py-0.5 rounded border ${
+                it.status === 'hidden'
+                  ? 'text-rose-300 border-rose-500/40 bg-rose-500/10'
+                  : 'text-amber-300 border-amber-400/40 bg-amber-400/10'
+              }`}
+            >
+              {it.status === 'hidden' ? 'Hidden automatically' : 'Still visible'}
+            </span>
+            <span className="text-slate-400">
+              {Number(it.report_count)} report{Number(it.report_count) === 1 ? '' : 's'}
+            </span>
+          </div>
+          <div className="text-[11px] text-slate-400">
+            By <span className="font-bold text-white">@{it.username}</span> (shown as {it.shown_as})
+          </div>
+          <p className="text-sm text-slate-100 whitespace-pre-wrap break-words bg-slate-900/70 border border-slate-800 rounded-xl px-3 py-2">
+            {it.body}
+          </p>
+          {Array.isArray(it.media) && it.media.length > 0 && (
+            <p className="text-[11px] text-slate-500">
+              Has {it.media.length} photo/video attachment{it.media.length === 1 ? '' : 's'}.
+            </p>
+          )}
+          {Array.isArray(it.reasons) && it.reasons.length > 0 && (
+            <p className="text-[11px] text-slate-400">Reasons given: {it.reasons.join(' | ')}</p>
+          )}
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={() => act(it, 'restore')}
+              className="flex-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black rounded-xl py-2 text-sm"
+            >
+              Looks fine, restore
+            </button>
+            <button
+              type="button"
+              onClick={() => act(it, 'remove')}
+              className="px-4 rounded-xl border border-rose-500/50 text-rose-300 hover:bg-rose-500/10 text-sm font-bold"
+            >
+              Remove
+            </button>
+          </div>
+        </div>
+      ))}
     </div>
   );
 }
@@ -4175,12 +5346,16 @@ export default function UKHalalAppMapbox() {
     { id: number; path: string }[]
   >([]);
   const [page, setPage] = useState<
-    'HOME' | 'MY_REVIEWS' | 'ADD_PLACE' | 'REVIEW_QUEUE'
+    'HOME' | 'MY_REVIEWS' | 'ADD_PLACE' | 'REVIEW_QUEUE' | 'COMMUNITY'
   >('HOME');
   const [addLevel, setAddLevel] = useState<'none' | 'trusted' | 'admin'>(
     'none'
   );
   const [pendingCount, setPendingCount] = useState(0);
+  const [reportCount, setReportCount] = useState(0);
+  const [communityAccess, setCommunityAccess] = useState<CommunityAccess | null>(
+    null
+  );
   const [reviewSort, setReviewSort] = useState<'newest' | 'oldest'>('newest');
   const [myReviews, setMyReviews] = useState<any[]>([]);
   const [myReviewsError, setMyReviewsError] = useState(false);
@@ -4281,6 +5456,7 @@ export default function UKHalalAppMapbox() {
         loadMyReviews();
         checkUserProfile(u.id);
         loadAddAccess();
+        loadCommunityAccess();
       } else {
         setFavorites([]);
         setVisited([]);
@@ -4292,6 +5468,8 @@ export default function UKHalalAppMapbox() {
         setMyPoints(0);
         setAddLevel('none');
         setPendingCount(0);
+        setReportCount(0);
+        setCommunityAccess(null);
         setSelectedFilter((f) => (f === 'FAVOURITES' ? 'ALL' : f));
       }
     });
@@ -4406,12 +5584,33 @@ export default function UKHalalAppMapbox() {
     if (error || !row) {
       setAddLevel('none');
       setPendingCount(0);
+      setReportCount(0);
       return;
     }
     setAddLevel(
       row.level === 'admin' || row.level === 'trusted' ? row.level : 'none'
     );
     setPendingCount(Number(row.pending_count) || 0);
+    if (row.level === 'admin') {
+      const { data: rc } = await supabase.rpc('get_community_report_count');
+      setReportCount(Number(rc) || 0);
+    } else {
+      setReportCount(0);
+    }
+  }
+
+  async function loadCommunityAccess() {
+    const { data, error } = await supabase.rpc('get_community_access');
+    const row: any = Array.isArray(data) ? data[0] : data;
+    if (error || !row || !row.can_view) {
+      setCommunityAccess(null);
+      return;
+    }
+    setCommunityAccess({
+      canPost: row.can_post === true,
+      tier: String(row.tier ?? 'novice'),
+      displayName: String(row.display_name ?? ''),
+    });
   }
 
   function handlePlaceAdded(row: any) {
@@ -5473,6 +6672,25 @@ export default function UKHalalAppMapbox() {
 
           {/* RIGHT: Profile & Sign Out / Sign In */}
           <div className="flex items-center gap-3">
+            {user && (
+              <button
+                onClick={() => {
+                  setRole('USER');
+                  setPage('COMMUNITY');
+                  loadCommunityAccess();
+                }}
+                aria-label="Community"
+                className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-bold border transition shadow-inner ${
+                  page === 'COMMUNITY'
+                    ? 'bg-emerald-500/20 border-emerald-500 text-emerald-300'
+                    : 'bg-slate-800/90 hover:bg-slate-800 border-slate-700 text-white'
+                }`}
+              >
+                <Users className="w-4 h-4 text-emerald-400" />
+                <span className="hidden sm:inline">Community</span>
+              </button>
+            )}
+
             {user && addLevel !== 'none' && (
               <button
                 onClick={() => {
@@ -5508,9 +6726,9 @@ export default function UKHalalAppMapbox() {
               >
                 <ClipboardCheck className="w-4 h-4 text-amber-400" />
                 <span className="hidden sm:inline">Review queue</span>
-                {pendingCount > 0 && (
+                {pendingCount + reportCount > 0 && (
                   <span className="min-w-[18px] h-[18px] px-1 rounded-full bg-rose-500 text-white text-[10px] font-black flex items-center justify-center">
-                    {pendingCount}
+                    {pendingCount + reportCount}
                   </span>
                 )}
               </button>
@@ -5584,7 +6802,18 @@ export default function UKHalalAppMapbox() {
 
       {/* MAIN CONTENT */}
       <main className="max-w-6xl mx-auto px-4 pt-6 space-y-6">
-        {page === 'ADD_PLACE' && user && addLevel !== 'none' ? (
+        {page === 'COMMUNITY' && user ? (
+          <CommunityPage
+            supabase={supabase}
+            user={user}
+            access={communityAccess}
+            restaurants={restaurants}
+            isAdmin={addLevel === 'admin'}
+            onBack={() => setPage('HOME')}
+            onOpenRestaurant={(id: number) => viewPlace({ restaurant_id: id })}
+            setNotice={setNotice}
+          />
+        ) : page === 'ADD_PLACE' && user && addLevel !== 'none' ? (
           <AddPlacePage
             supabase={supabase}
             level={addLevel}
